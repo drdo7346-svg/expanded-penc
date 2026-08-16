@@ -1,0 +1,1 @@
+Windows protected build staging repository.
