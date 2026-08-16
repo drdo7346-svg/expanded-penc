@@ -25,7 +25,7 @@ jobs:
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SOURCE_TREE: 9a0b3b6fdb4576b0fc3e92750b080115a63f1f30
+          SOURCE_TREE: 59a5d2606ad214dcea9ccee3b86d85460c82435a
           SOURCE_SHA256: fea40c9e2cc88063c02397904a7f2401577b488f7682e03022e73f48b8f5fe44
         run: |
           @'
@@ -37,7 +37,7 @@ jobs:
               with urllib.request.urlopen(req) as r: return json.load(r)
           tree=get_json(f'https://api.github.com/repos/{repo}/git/trees/{tree_sha}?recursive=1')
           blobs={x['path']:x['sha'] for x in tree['tree'] if x.get('type')=='blob'}
-          names=['src/source_payload.b64']+[f'src/cont{i:03}.b64' for i in range(15)]
+          names=['src/source_payload.b64']+[f'src/cont{i:03}.b64' for i in range(14)]
           pieces=[]
           for name in names:
               obj=get_json(f"https://api.github.com/repos/{repo}/git/blobs/{blobs[name]}")
