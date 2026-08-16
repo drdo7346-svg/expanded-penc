@@ -1,0 +1,78 @@
+name: Build protected PenC EXE
+
+on:
+  push:
+    branches: [build-stock-save-fix]
+    paths:
+      - "build/source_payload.b64"
+      - ".github/workflows/build-protected-exe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: "x64"
+
+      - name: Reconstruct and verify exact uploaded source
+        shell: pwsh
+        run: |
+          python -c "import base64,lzma,pathlib,hashlib; b64=pathlib.Path('build/source_payload.b64').read_text().strip(); raw=lzma.decompress(base64.b64decode(b64)); p=pathlib.Path('penc_editor.py'); p.write_bytes(raw); h=hashlib.sha256(raw).hexdigest(); print('SOURCE SIZE:',len(raw)); print('SOURCE SHA256:',h); assert h=='fea40c9e2cc88063c02397904a7f2401577b488f7682e03022e73f48b8f5fe44'"
+
+      - name: Syntax check
+        shell: pwsh
+        run: python -m py_compile penc_editor.py
+
+      - name: Install Nuitka dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pillow nuitka ordered-set zstandard
+          python -m nuitka --version
+
+      - name: Build standalone protected GUI EXE
+        shell: pwsh
+        run: |
+          python -m nuitka `
+            --mode=onefile `
+            --windows-console-mode=disable `
+            --enable-plugin=tk-inter `
+            --include-package=PIL `
+            --assume-yes-for-downloads `
+            --lto=yes `
+            --output-dir=dist `
+            --output-filename=PenC_Universal_Editor_STOCK_SAVE_FIX_Protected.exe `
+            penc_editor.py
+
+      - name: Verify Windows executable
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'dist\PenC_Universal_Editor_STOCK_SAVE_FIX_Protected.exe'
+          $item = Get-Item $exe
+          if ($item.Length -lt 1000000) { throw "EXE unexpectedly small: $($item.Length) bytes" }
+          $fs = [IO.File]::OpenRead($exe)
+          try {
+            $b0 = $fs.ReadByte(); $b1 = $fs.ReadByte()
+          } finally { $fs.Dispose() }
+          if ($b0 -ne 0x4D -or $b1 -ne 0x5A) { throw 'Output is not a Windows PE executable' }
+          Write-Host "EXE SIZE: $($item.Length)"
+          Get-FileHash $exe -Algorithm SHA256
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PenC_Universal_Editor_STOCK_SAVE_FIX_Nuitka_Windows_x64
+          path: dist/PenC_Universal_Editor_STOCK_SAVE_FIX_Protected.exe
+          if-no-files-found: error
+          retention-days: 30
