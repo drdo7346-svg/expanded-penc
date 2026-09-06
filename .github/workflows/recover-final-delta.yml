@@ -1,0 +1,148 @@
+name: Recover Final PenC Delta
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/recover-final-delta.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout payload branch
+        uses: actions/checkout@v4
+        with:
+          ref: final-editor-payload-clean
+
+      - name: Assemble and verify exact delta
+        shell: bash
+        env:
+          TARGET_B64_LEN: '378600'
+          TARGET_PACKED_SIZE: '283948'
+          TARGET_PACKED_SHA256: 1410f50a758429661a470c731ec28a656f58b68cb775415f2fb32f191c51ab11
+          TARGET_RAW_SHA256: 9176ac832a8047b6841395aa05f18446654db765f2e94c6305ca830e9277538b
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, hashlib, itertools, lzma, os
+
+          dirs = ['delta_parts', 'delta_tail', 'final_patch_parts', 'patch19', 'verified_patch']
+          groups = {}
+          for d in dirs:
+              p = Path(d)
+              if not p.exists():
+                  continue
+              files = sorted(x for x in p.iterdir() if x.is_file())
+              s = ''.join(x.read_text(encoding='ascii').strip() for x in files)
+              groups[d] = s
+              print(f'GROUP {d}: files={len(files)} chars={len(s)} head={s[:20]!r} tail={s[-20:]!r}')
+
+          target_len = int(os.environ['TARGET_B64_LEN'])
+          target_size = int(os.environ['TARGET_PACKED_SIZE'])
+          target_sha = os.environ['TARGET_PACKED_SHA256']
+          target_raw_sha = os.environ['TARGET_RAW_SHA256']
+
+          def overlap(a, b):
+              # largest suffix(a) == prefix(b)
+              m = min(len(a), len(b))
+              # Base64 fragments here are large; test candidate sizes from large down.
+              for k in range(m, 15, -1):
+                  if a[-k:] == b[:k]:
+                      return k
+              return 0
+
+          print('\nPAIRWISE OVERLAPS')
+          names = list(groups)
+          for a in names:
+              for b in names:
+                  if a != b:
+                      k = overlap(groups[a], groups[b])
+                      if k:
+                          print(f'{a} -> {b}: {k}')
+
+          # Reduce exact-contained groups; keep diagnostics.
+          for a in names:
+              for b in names:
+                  if a != b and groups[a] in groups[b]:
+                      print(f'CONTAINED: {a} inside {b} at {groups[b].find(groups[a])}')
+
+          def merged_for_order(order, use_overlap=True):
+              s = groups[order[0]]
+              for name in order[1:]:
+                  g = groups[name]
+                  if g in s:
+                      continue
+                  if use_overlap:
+                      k = overlap(s, g)
+                      s += g[k:]
+                  else:
+                      s += g
+              return s
+
+          seen = set()
+          attempts = 0
+          found = None
+          found_desc = None
+
+          # First try every ordered subset of 2..all groups, with and without overlap merge.
+          for r in range(2, len(names)+1):
+              for order in itertools.permutations(names, r):
+                  for use_overlap in (True, False):
+                      s = merged_for_order(order, use_overlap)
+                      key = hashlib.sha256(s.encode('ascii')).digest()
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      attempts += 1
+                      if len(s) != target_len:
+                          continue
+                      try:
+                          packed = base64.b64decode(s, validate=True)
+                      except Exception:
+                          continue
+                      sha = hashlib.sha256(packed).hexdigest()
+                      print('LEN MATCH:', order, 'overlap=', use_overlap, 'packed=', len(packed), 'sha=', sha)
+                      if len(packed) == target_size and sha == target_sha:
+                          found = packed
+                          found_desc = (order, use_overlap)
+                          break
+                  if found is not None:
+                      break
+              if found is not None:
+                  break
+
+          # If group-level assembly did not match, try placing each group by exact substring
+          # relationships against all other groups and report unique prefix/suffix fingerprints.
+          if found is None:
+              print(f'NO EXACT GROUP ASSEMBLY after {attempts} unique attempts')
+              for name, s in groups.items():
+                  try:
+                      b = base64.b64decode(s + '=' * ((-len(s)) % 4), validate=False)
+                      print(f'PARTIAL {name}: decoded={len(b)} sha={hashlib.sha256(b).hexdigest()} first32={b[:32].hex()} last32={b[-32:].hex()}')
+                  except Exception as e:
+                      print(f'PARTIAL {name}: decode error {e!r}')
+              raise SystemExit(2)
+
+          print('FOUND EXACT DELTA:', found_desc)
+          print('PACKED SIZE:', len(found))
+          print('PACKED SHA256:', hashlib.sha256(found).hexdigest())
+          raw = lzma.decompress(found)
+          raw_sha = hashlib.sha256(raw).hexdigest()
+          print('RAW SIZE:', len(raw))
+          print('RAW SHA256:', raw_sha)
+          if raw_sha != target_raw_sha:
+              raise SystemExit(f'raw hash mismatch: {raw_sha}')
+          Path('final_delta_v10_recovered.xz').write_bytes(found)
+          PY
+
+      - name: Upload recovered exact delta
+        uses: actions/upload-artifact@v4
+        with:
+          name: final_delta_v10_recovered
+          path: final_delta_v10_recovered.xz
+          if-no-files-found: error
+          retention-days: 1
