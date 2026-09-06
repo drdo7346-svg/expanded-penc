@@ -202,3 +202,5 @@ jobs:
           path: dist/PenC_Expansion_Editor_FINAL.exe
           if-no-files-found: error
           retention-days: 30
+
+# build trigger: exact recovered source 2026-09-07
