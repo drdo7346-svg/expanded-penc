@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'PenC_Expansion_Editor_FINAL.py'
+      - '.github/workflows/build-penc-editor.yml'
 
 permissions:
   contents: read
@@ -15,8 +15,10 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Checkout repository
+      - name: Checkout verified final payload
         uses: actions/checkout@v4
+        with:
+          ref: build-final-editor-v10
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,12 +26,98 @@ jobs:
           python-version: '3.12'
           architecture: 'x64'
 
-      - name: Verify source
+      - name: Reconstruct and verify final source
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_TREE: 59a5d2606ad214dcea9ccee3b86d85460c82435a
+          OLD_SHA256: fea40c9e2cc88063c02397904a7f2401577b488f7682e03022e73f48b8f5fe44
+          NEW_SHA256: 78902cd23df548c1cd2d305d653cf1ad49abd7c340255763e8f06036aa28fbc9
+          PATCH_PACKED_SHA256: 1410f50a758429661a470c731ec28a656f58b68cb775415f2fb32f191c51ab11
+          PATCH_RAW_SHA256: 9176ac832a8047b6841395aa05f18446654db765f2e94c6305ca830e9277538b
         run: |
-          if (-not (Test-Path 'PenC_Expansion_Editor_FINAL.py')) {
-            throw 'PenC_Expansion_Editor_FINAL.py is missing from repository root.'
+          @'
+          import os
+          import json
+          import base64
+          import lzma
+          import hashlib
+          import pathlib
+          import urllib.request
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['GITHUB_TOKEN']
+          headers = {
+              'Authorization': f'Bearer {token}',
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'penc-final-build',
           }
+
+          def get_json(url):
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  return json.load(r)
+
+          tree_sha = os.environ['SOURCE_TREE']
+          tree = get_json(f'https://api.github.com/repos/{repo}/git/trees/{tree_sha}?recursive=1')
+          blobs = {x['path']: x['sha'] for x in tree['tree'] if x.get('type') == 'blob'}
+          names = ['src/source_payload.b64'] + [f'src/cont{i:03}.b64' for i in range(14)]
+          pieces = []
+          for name in names:
+              if name not in blobs:
+                  raise SystemExit(f'Missing old-source object: {name}')
+              obj = get_json(f"https://api.github.com/repos/{repo}/git/blobs/{blobs[name]}")
+              pieces.append(base64.b64decode(obj['content']).decode('ascii').strip())
+
+          old = lzma.decompress(base64.b64decode(''.join(pieces)))
+          old_sha = hashlib.sha256(old).hexdigest()
+          print('OLD SOURCE SIZE:', len(old))
+          print('OLD SOURCE SHA256:', old_sha)
+          if old_sha != os.environ['OLD_SHA256']:
+              raise SystemExit(f'Old source SHA mismatch: {old_sha}')
+
+          packed = pathlib.Path('final_delta_v10.xz').read_bytes()
+          packed_sha = hashlib.sha256(packed).hexdigest()
+          print('PATCH PACKED SIZE:', len(packed))
+          print('PATCH PACKED SHA256:', packed_sha)
+          if packed_sha != os.environ['PATCH_PACKED_SHA256']:
+              raise SystemExit(f'Packed patch SHA mismatch: {packed_sha}')
+
+          raw = lzma.decompress(packed)
+          raw_sha = hashlib.sha256(raw).hexdigest()
+          print('PATCH RAW SIZE:', len(raw))
+          print('PATCH RAW SHA256:', raw_sha)
+          if raw_sha != os.environ['PATCH_RAW_SHA256']:
+              raise SystemExit(f'Raw patch SHA mismatch: {raw_sha}')
+
+          patch = json.loads(raw.decode('utf-8'))
+          if patch.get('old_sha') != os.environ['OLD_SHA256']:
+              raise SystemExit('Patch old_sha mismatch')
+          if patch.get('new_sha') != os.environ['NEW_SHA256']:
+              raise SystemExit('Patch new_sha mismatch')
+
+          old_lines = old.decode('utf-8').splitlines(keepends=True)
+          out = []
+          for op in patch['ops']:
+              if op[0] == 'c':
+                  start, count = int(op[1]), int(op[2])
+                  out.extend(old_lines[start:start + count])
+              elif op[0] == 'i':
+                  out.append(op[1])
+              else:
+                  raise SystemExit(f'Unknown patch op: {op[0]}')
+
+          new = ''.join(out).encode('utf-8')
+          new_sha = hashlib.sha256(new).hexdigest()
+          print('FINAL SOURCE SIZE:', len(new))
+          print('FINAL SOURCE SHA256:', new_sha)
+          if new_sha != os.environ['NEW_SHA256']:
+              raise SystemExit(f'Final source SHA mismatch: {new_sha}')
+
+          pathlib.Path('PenC_Expansion_Editor_FINAL.py').write_bytes(new)
+          '@ | Set-Content reconstruct_final.py -Encoding UTF8
+          python reconstruct_final.py
           python -m py_compile PenC_Expansion_Editor_FINAL.py
 
       - name: Install Nuitka dependencies
