@@ -1,0 +1,162 @@
+name: Recover Final PenC Delta Binary
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/recover-final-delta-binary.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout payload branch
+        uses: actions/checkout@v4
+        with:
+          ref: final-editor-payload-clean
+
+      - name: Decode binary chunks and recover exact XZ
+        shell: bash
+        env:
+          TARGET_SIZE: '283948'
+          TARGET_SHA256: 1410f50a758429661a470c731ec28a656f58b68cb775415f2fb32f191c51ab11
+          TARGET_RAW_SHA256: 9176ac832a8047b6841395aa05f18446654db765f2e94c6305ca830e9277538b
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, hashlib, itertools, lzma, os
+
+          dir_patterns = {
+              'delta_parts': 'part*.b64',
+              'delta_tail': 'tail*.b64',
+              'final_patch_parts': 'part*.b64',
+              'patch19': 'p*.b64',
+              'verified_patch': 'p*.b64',
+          }
+          groups = {}
+          chunks = {}
+          for d, pat in dir_patterns.items():
+              files = sorted(Path(d).glob(pat))
+              if not files:
+                  continue
+              arr=[]
+              for p in files:
+                  s=p.read_text(encoding='ascii').strip()
+                  b=base64.b64decode(s, validate=True)
+                  arr.append(b)
+                  print(f'CHUNK {d}/{p.name}: chars={len(s)} bytes={len(b)} sha={hashlib.sha256(b).hexdigest()} head={b[:8].hex()} tail={b[-8:].hex()}')
+              chunks[d]=arr
+              g=b''.join(arr)
+              groups[d]=g
+              print(f'GROUP {d}: files={len(arr)} bytes={len(g)} sha={hashlib.sha256(g).hexdigest()} head={g[:16].hex()} tail={g[-16:].hex()}')
+
+          target_size=int(os.environ['TARGET_SIZE'])
+          target_sha=os.environ['TARGET_SHA256']
+          target_raw_sha=os.environ['TARGET_RAW_SHA256']
+
+          def max_overlap(a,b):
+              # O(n) KMP: longest suffix(a) equal to prefix(b).
+              tail=a[-min(len(a),len(b)):]
+              seq=list(b)+[256]+list(tail)
+              pi=[0]*len(seq)
+              for i in range(1,len(seq)):
+                  j=pi[i-1]
+                  while j and seq[i]!=seq[j]:
+                      j=pi[j-1]
+                  if seq[i]==seq[j]:
+                      j+=1
+                  pi[i]=j
+              return min(pi[-1],len(a),len(b))
+
+          names=list(groups)
+          print('\nPAIRWISE BINARY OVERLAPS')
+          overlaps={}
+          for a in names:
+              for b in names:
+                  if a==b: continue
+                  k=max_overlap(groups[a],groups[b])
+                  overlaps[(a,b)]=k
+                  if k:
+                      print(f'{a} -> {b}: {k} bytes')
+                  pos=groups[a].find(groups[b])
+                  if pos>=0:
+                      print(f'CONTAINMENT: {b} inside {a} at {pos}')
+
+          def merge_order(order):
+              out=groups[order[0]]
+              for name in order[1:]:
+                  g=groups[name]
+                  pos=out.find(g)
+                  if pos>=0:
+                      continue
+                  k=max_overlap(out,g)
+                  out += g[k:]
+              return out
+
+          found=None
+          desc=None
+          seen=set()
+          for r in range(1,len(names)+1):
+              for order in itertools.permutations(names,r):
+                  out=merge_order(order)
+                  sig=(len(out),hashlib.sha256(out).digest())
+                  if sig in seen: continue
+                  seen.add(sig)
+                  if len(out)==target_size:
+                      sha=hashlib.sha256(out).hexdigest()
+                      print('SIZE MATCH',order,'sha',sha)
+                      if sha==target_sha:
+                          found=out; desc=order; break
+              if found is not None: break
+
+          # Also treat every decoded file as an independent segment. Build a greedy chain
+          # starting from the unique XZ-header chunks and always choose the largest suffix/prefix overlap.
+          if found is None:
+              allsegs=[]
+              for d,arr in chunks.items():
+                  for i,b in enumerate(arr): allsegs.append((f'{d}:{i}',b))
+              starts=[i for i,(n,b) in enumerate(allsegs) if b.startswith(bytes.fromhex('fd377a585a00'))]
+              print('XZ HEADER SEGMENTS:',[(allsegs[i][0],len(allsegs[i][1])) for i in starts])
+              for si in starts:
+                  used={si}; out=allsegs[si][1]; chain=[allsegs[si][0]]
+                  while len(out)<target_size:
+                      best=None
+                      for j,(n,b) in enumerate(allsegs):
+                          if j in used: continue
+                          if out.find(b)>=0: continue
+                          k=max_overlap(out,b)
+                          if k and (best is None or k>best[0]): best=(k,j,n,b)
+                      if best is None: break
+                      k,j,n,b=best
+                      out += b[k:]; used.add(j); chain.append(f'{n}(-{k})')
+                      if len(out)==target_size and hashlib.sha256(out).hexdigest()==target_sha:
+                          found=out; desc=chain; break
+                      if len(out)>target_size: break
+                  print('GREEDY',allsegs[si][0],'len',len(out),'chain',chain)
+                  if found is not None: break
+
+          if found is None:
+              raise SystemExit('Exact 283948-byte delta not recoverable from current fragment groups')
+
+          print('FOUND EXACT DELTA:',desc)
+          print('PACKED SIZE:',len(found))
+          print('PACKED SHA256:',hashlib.sha256(found).hexdigest())
+          raw=lzma.decompress(found)
+          rawsha=hashlib.sha256(raw).hexdigest()
+          print('RAW SIZE:',len(raw))
+          print('RAW SHA256:',rawsha)
+          if rawsha!=target_raw_sha:
+              raise SystemExit(f'raw hash mismatch {rawsha}')
+          Path('final_delta_v10_recovered.xz').write_bytes(found)
+          PY
+
+      - name: Upload recovered exact delta
+        uses: actions/upload-artifact@v4
+        with:
+          name: final_delta_v10_recovered
+          path: final_delta_v10_recovered.xz
+          if-no-files-found: error
+          retention-days: 1
