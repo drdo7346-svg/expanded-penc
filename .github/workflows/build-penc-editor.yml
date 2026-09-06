@@ -15,10 +15,10 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - name: Checkout verified final payload
+      - name: Checkout recovered exact payload
         uses: actions/checkout@v4
         with:
-          ref: build-final-editor-v10
+          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -26,7 +26,7 @@ jobs:
           python-version: '3.12'
           architecture: 'x64'
 
-      - name: Reconstruct and verify final source
+      - name: Reconstruct and verify exact uploaded source
         shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -34,7 +34,9 @@ jobs:
           OLD_SHA256: fea40c9e2cc88063c02397904a7f2401577b488f7682e03022e73f48b8f5fe44
           NEW_SHA256: 78902cd23df548c1cd2d305d653cf1ad49abd7c340255763e8f06036aa28fbc9
           PATCH_PACKED_SHA256: 1410f50a758429661a470c731ec28a656f58b68cb775415f2fb32f191c51ab11
+          PATCH_PACKED_SIZE: '283948'
           PATCH_RAW_SHA256: 9176ac832a8047b6841395aa05f18446654db765f2e94c6305ca830e9277538b
+          PATCH_RAW_SIZE: '2031739'
         run: |
           @'
           import os
@@ -59,6 +61,11 @@ jobs:
               with urllib.request.urlopen(req) as r:
                   return json.load(r)
 
+          def decode_file(path):
+              text = pathlib.Path(path).read_text(encoding='ascii').strip()
+              return base64.b64decode(text, validate=True)
+
+          # Reconstruct the exact old source from immutable Git objects.
           tree_sha = os.environ['SOURCE_TREE']
           tree = get_json(f'https://api.github.com/repos/{repo}/git/trees/{tree_sha}?recursive=1')
           blobs = {x['path']: x['sha'] for x in tree['tree'] if x.get('type') == 'blob'}
@@ -77,10 +84,33 @@ jobs:
           if old_sha != os.environ['OLD_SHA256']:
               raise SystemExit(f'Old source SHA mismatch: {old_sha}')
 
-          packed = pathlib.Path('final_delta_v10.xz').read_bytes()
+          # Reassemble the exact historical XZ from independently verified chunks.
+          chunks = []
+          for i in range(5):
+              chunks.append(decode_file(f'delta_parts/part{i:03}.b64'))
+          chunks.append(decode_file('exact_delta_missing/chunk05.b64'))
+          for i in range(6, 10):
+              chunks.append(decode_file(f'delta_parts/part{i:03}.b64'))
+          tail0 = decode_file('delta_tail/tail000.b64')
+          if len(tail0) < 9000:
+              raise SystemExit(f'delta_tail/tail000 too short: {len(tail0)}')
+          chunks.append(tail0[:9000])
+          chunks.append(decode_file('delta_parts/part011.b64'))
+          for i in range(12, 32):
+              chunks.append(decode_file(f'exact_delta_missing/chunk{i:02}.b64'))
+
+          expected_chunk_sizes = [9000] * 31 + [4948]
+          actual_chunk_sizes = [len(x) for x in chunks]
+          print('CHUNK SIZES:', actual_chunk_sizes)
+          if actual_chunk_sizes != expected_chunk_sizes:
+              raise SystemExit(f'Chunk size mismatch: {actual_chunk_sizes}')
+
+          packed = b''.join(chunks)
           packed_sha = hashlib.sha256(packed).hexdigest()
           print('PATCH PACKED SIZE:', len(packed))
           print('PATCH PACKED SHA256:', packed_sha)
+          if len(packed) != int(os.environ['PATCH_PACKED_SIZE']):
+              raise SystemExit(f'Packed patch size mismatch: {len(packed)}')
           if packed_sha != os.environ['PATCH_PACKED_SHA256']:
               raise SystemExit(f'Packed patch SHA mismatch: {packed_sha}')
 
@@ -88,6 +118,8 @@ jobs:
           raw_sha = hashlib.sha256(raw).hexdigest()
           print('PATCH RAW SIZE:', len(raw))
           print('PATCH RAW SHA256:', raw_sha)
+          if len(raw) != int(os.environ['PATCH_RAW_SIZE']):
+              raise SystemExit(f'Raw patch size mismatch: {len(raw)}')
           if raw_sha != os.environ['PATCH_RAW_SHA256']:
               raise SystemExit(f'Raw patch SHA mismatch: {raw_sha}')
 
