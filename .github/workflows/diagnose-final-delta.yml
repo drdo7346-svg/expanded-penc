@@ -1,0 +1,40 @@
+name: Diagnose Final Delta
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diagnose-final-delta.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect delta payload
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import base64, lzma, hashlib, json
+          files = sorted(Path('delta_parts').glob('part*.b64')) + sorted(Path('delta_tail').glob('tail*.b64'))
+          print('files:', [str(p) for p in files])
+          joined = ''.join(p.read_text(encoding='ascii').strip() for p in files)
+          print('b64 chars:', len(joined))
+          packed = base64.b64decode(joined)
+          print('packed size:', len(packed), 'sha256:', hashlib.sha256(packed).hexdigest(), 'head:', packed[:32].hex())
+          raw = lzma.decompress(packed)
+          print('raw size:', len(raw), 'sha256:', hashlib.sha256(raw).hexdigest())
+          print('raw head repr:', repr(raw[:500]))
+          print('raw tail repr:', repr(raw[-500:]))
+          try:
+              txt = raw.decode('utf-8')
+              print('utf8: yes')
+              print('first lines:')
+              print('\n'.join(txt.splitlines()[:20]))
+          except Exception as e:
+              print('utf8: no', type(e).__name__, str(e))
+          PY
