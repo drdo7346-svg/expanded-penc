@@ -1,4 +1,4 @@
-name: Export Existing PenC Source
+name: Verify Existing PenC Final Patch
 
 on:
   push:
@@ -10,53 +10,123 @@ permissions:
   contents: read
 
 jobs:
-  export:
+  verify:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout final editor payload branch
+      - name: Checkout verified patch payload
         uses: actions/checkout@v4
         with:
-          ref: build-final-editor-v9
-      - name: Try boundary repairs
+          ref: final-editor-payload-clean
+
+      - name: Verify and reconstruct final source
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_TREE: 59a5d2606ad214dcea9ccee3b86d85460c82435a
+          OLD_SHA256: fea40c9e2cc88063c02397904a7f2401577b488f7682e03022e73f48b8f5fe44
+          NEW_SHA256: 78902cd23df548c1cd2d305d653cf1ad49abd7c340255763e8f06036aa28fbc9
         run: |
           python - <<'PY'
           from pathlib import Path
-          import base64, lzma, hashlib
-          parts=[p.read_text(encoding='ascii').strip() for p in sorted(Path('delta_parts').glob('part*.b64'))]
-          tails=[p.read_text(encoding='ascii').strip() for p in sorted(Path('delta_tail').glob('tail*.b64'))]
-          def dec(s): return base64.b64decode(s, validate=True)
-          fixed={}
-          for i,s in enumerate(parts):
-              if i not in (5,10): fixed[i]=dec(s)
-          p5c=[parts[5]+'=', parts[5][:-1]+'==', parts[5][1:]+'==']
-          p10c=[parts[10][:-5], parts[10][5:]]
-          for a,p5s in enumerate(p5c):
-              try: p5=dec(p5s)
+          import base64, lzma, hashlib, json, os, urllib.request
+
+          repo=os.environ['GITHUB_REPOSITORY']
+          token=os.environ['GITHUB_TOKEN']
+          headers={
+              'Authorization':f'Bearer {token}',
+              'Accept':'application/vnd.github+json',
+              'X-GitHub-Api-Version':'2022-11-28',
+              'User-Agent':'penc-verify-final-patch',
+          }
+          def get_json(url):
+              req=urllib.request.Request(url,headers=headers)
+              with urllib.request.urlopen(req) as r:
+                  return json.load(r)
+
+          tree=get_json(f"https://api.github.com/repos/{repo}/git/trees/{os.environ['SOURCE_TREE']}?recursive=1")
+          blobs={x['path']:x['sha'] for x in tree['tree'] if x.get('type')=='blob'}
+          names=['src/source_payload.b64']+[f'src/cont{i:03}.b64' for i in range(14)]
+          pieces=[]
+          for name in names:
+              obj=get_json(f"https://api.github.com/repos/{repo}/git/blobs/{blobs[name]}")
+              pieces.append(base64.b64decode(obj['content']).decode('ascii').strip())
+          old=lzma.decompress(base64.b64decode(''.join(pieces)))
+          old_sha=hashlib.sha256(old).hexdigest()
+          print('OLD SIZE',len(old),'SHA',old_sha)
+          if old_sha != os.environ['OLD_SHA256']:
+              raise SystemExit('old source mismatch')
+
+          files=sorted(Path('verified_patch').glob('p*.b64'))
+          print('PATCH FILES',[(p.name,p.stat().st_size) for p in files])
+          strings=[p.read_text(encoding='ascii').strip() for p in files]
+
+          candidates=[]
+          try:
+              candidates.append(('joined-b64', base64.b64decode(''.join(strings), validate=True)))
+          except Exception as e:
+              print('joined-b64 decode failed',repr(e))
+          try:
+              candidates.append(('per-file-b64', b''.join(base64.b64decode(s,validate=True) for s in strings)))
+          except Exception as e:
+              print('per-file-b64 decode failed',repr(e))
+
+          success=False
+          for label,packed in candidates:
+              print(label,'PACKED SIZE',len(packed),'SHA',hashlib.sha256(packed).hexdigest(),'HEAD',packed[:16].hex())
+              raw_variants=[]
+              try:
+                  raw_variants.append(('lzma',lzma.decompress(packed)))
               except Exception as e:
-                  print('P5 candidate',a,'decode fail',e); continue
-              for b,p10s in enumerate(p10c):
-                  try: p10=dec(p10s)
-                  except Exception as e:
-                      print('P10 candidate',b,'decode fail',e); continue
-                  blobs=[]
-                  for i in range(len(parts)):
-                      blobs.append(p5 if i==5 else p10 if i==10 else fixed[i])
+                  print(label,'lzma failed',repr(e))
+              raw_variants.append(('plain',packed))
+              for rawlabel,raw in raw_variants:
+                  print(label,rawlabel,'RAW SIZE',len(raw),'SHA',hashlib.sha256(raw).hexdigest(),'HEAD',repr(raw[:160]))
                   try:
-                      blobs += [dec(x) for x in tails]
-                      packed=b''.join(blobs)
-                      raw=lzma.decompress(packed)
-                      print('SUCCESS',a,b,'packed',len(packed),hashlib.sha256(packed).hexdigest(),'raw',len(raw),hashlib.sha256(raw).hexdigest())
-                      Path('final_delta_raw.bin').write_bytes(raw)
-                      raise SystemExit(0)
-                  except lzma.LZMAError as e:
-                      print('candidate',a,b,'lzma fail',e)
-          raise SystemExit('No simple boundary repair worked')
+                      obj=json.loads(raw.decode('utf-8'))
+                  except Exception as e:
+                      print(label,rawlabel,'json failed',repr(e))
+                      continue
+                  print('JSON TYPE',type(obj).__name__)
+                  if isinstance(obj,dict):
+                      print('JSON KEYS',sorted(obj.keys()))
+                      print('OLD_SHA FIELD',obj.get('old_sha'))
+                      print('NEW_SHA FIELD',obj.get('new_sha'))
+                  else:
+                      print('JSON PREVIEW',repr(obj)[:1000])
+
+                  patch=obj
+                  if not isinstance(patch,dict) or 'ops' not in patch:
+                      continue
+                  old_lines=old.decode('utf-8').splitlines(keepends=True)
+                  out=[]
+                  for op in patch['ops']:
+                      if op[0]=='c':
+                          start,count=int(op[1]),int(op[2])
+                          out.extend(old_lines[start:start+count])
+                      elif op[0]=='i':
+                          out.append(op[1])
+                      else:
+                          raise SystemExit(f'unknown op {op[0]!r}')
+                  new=''.join(out).encode('utf-8')
+                  sha=hashlib.sha256(new).hexdigest()
+                  print('RECONSTRUCTED SIZE',len(new),'SHA',sha)
+                  if sha==os.environ['NEW_SHA256']:
+                      Path('PenC_Expansion_Editor_FINAL.py').write_bytes(new)
+                      print('VERIFIED FINAL SOURCE')
+                      success=True
+                      break
+              if success:
+                  break
+          if not success:
+              raise SystemExit('verified_patch did not reconstruct expected final source')
           PY
-      - name: Upload repaired delta
+
+          python -m py_compile PenC_Expansion_Editor_FINAL.py
+
+      - name: Upload verified source
         uses: actions/upload-artifact@v4
         with:
-          name: final-delta-raw
-          path: final_delta_raw.bin
+          name: PenC_Expansion_Editor_FINAL_verified_source
+          path: PenC_Expansion_Editor_FINAL.py
           if-no-files-found: error
           retention-days: 1
