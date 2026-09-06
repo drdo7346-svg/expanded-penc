@@ -17,32 +17,46 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: build-final-editor-v9
-      - name: Inspect valid delta prefix
+      - name: Try boundary repairs
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           import base64, lzma, hashlib
-          files=sorted(Path('delta_parts').glob('part*.b64'))
-          good=[]
-          for p in files:
-              s=p.read_text(encoding='ascii').strip()
-              try:
-                  b=base64.b64decode(s, validate=True)
+          parts=[p.read_text(encoding='ascii').strip() for p in sorted(Path('delta_parts').glob('part*.b64'))]
+          tails=[p.read_text(encoding='ascii').strip() for p in sorted(Path('delta_tail').glob('tail*.b64'))]
+          def dec(s): return base64.b64decode(s, validate=True)
+          fixed={}
+          for i,s in enumerate(parts):
+              if i not in (5,10): fixed[i]=dec(s)
+          p5c=[parts[5]+'=', parts[5][:-1]+'==', parts[5][1:]+'==']
+          p10c=[parts[10][:-5], parts[10][5:]]
+          for a,p5s in enumerate(p5c):
+              try: p5=dec(p5s)
               except Exception as e:
-                  print('FIRST BAD:', p, 'len=', len(s), type(e).__name__, str(e))
-                  break
-              print('GOOD:', p, 'len=', len(s), 'decoded=', len(b), 'sha=', hashlib.sha256(b).hexdigest())
-              good.append(b)
-          packed=b''.join(good)
-          print('PREFIX PACKED SIZE:', len(packed))
-          d=lzma.LZMADecompressor()
-          raw=d.decompress(packed)
-          print('PREFIX RAW SIZE:', len(raw), 'eof=', d.eof)
-          print('RAW HEAD REPR:', repr(raw[:1000]))
-          print('RAW TAIL REPR:', repr(raw[-1000:]))
-          try:
-              print('RAW HEAD TEXT:', raw[:2000].decode('utf-8'))
-          except Exception as e:
-              print('RAW NOT UTF8:', type(e).__name__, str(e))
+                  print('P5 candidate',a,'decode fail',e); continue
+              for b,p10s in enumerate(p10c):
+                  try: p10=dec(p10s)
+                  except Exception as e:
+                      print('P10 candidate',b,'decode fail',e); continue
+                  blobs=[]
+                  for i in range(len(parts)):
+                      blobs.append(p5 if i==5 else p10 if i==10 else fixed[i])
+                  try:
+                      blobs += [dec(x) for x in tails]
+                      packed=b''.join(blobs)
+                      raw=lzma.decompress(packed)
+                      print('SUCCESS',a,b,'packed',len(packed),hashlib.sha256(packed).hexdigest(),'raw',len(raw),hashlib.sha256(raw).hexdigest())
+                      Path('final_delta_raw.bin').write_bytes(raw)
+                      raise SystemExit(0)
+                  except lzma.LZMAError as e:
+                      print('candidate',a,b,'lzma fail',e)
+          raise SystemExit('No simple boundary repair worked')
           PY
+      - name: Upload repaired delta
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-delta-raw
+          path: final_delta_raw.bin
+          if-no-files-found: error
+          retention-days: 1
