@@ -25,9 +25,13 @@ jobs:
           import base64, lzma, hashlib
           files = sorted(Path('delta_parts').glob('part*.b64')) + sorted(Path('delta_tail').glob('tail*.b64'))
           print('FILES:', [str(p) for p in files])
-          joined = ''.join(p.read_text(encoding='ascii').strip() for p in files)
-          print('B64 CHARS:', len(joined))
-          packed = base64.b64decode(joined)
+          packed_parts=[]
+          for p in files:
+              b64=p.read_text(encoding='ascii').strip()
+              piece=base64.b64decode(b64)
+              print(p, 'b64=', len(b64), 'decoded=', len(piece), 'sha=', hashlib.sha256(piece).hexdigest())
+              packed_parts.append(piece)
+          packed=b''.join(packed_parts)
           print('PACKED SIZE:', len(packed))
           print('PACKED SHA256:', hashlib.sha256(packed).hexdigest())
           print('PACKED HEAD:', packed[:32].hex())
