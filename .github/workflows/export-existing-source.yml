@@ -23,8 +23,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_TREE: 59a5d2606ad214dcea9ccee3b86d85460c82435a
-          OLD_SHA256: fea40c9e2cc88063c02397904a7f2401577b488f7682e03022e73f48b8f5fe44
-          NEW_SHA256: 78902cd23df548c1cd2d305d653cf1ad49abd7c340255763e8f06036aa28fbc9
+          OLD_SHA256: fea40c9e2cc880636a2eb803dab44bad83925eefc222d574d75dd102f2046500
+          NEW_SHA256: 78902cd23df548c7fe5ef41287413113f7934dca5e4e526d7b480219d842307e
         run: |
           python - <<'PY'
           from pathlib import Path
