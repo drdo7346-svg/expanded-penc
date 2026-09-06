@@ -13,20 +13,23 @@ jobs:
   export:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Reconstruct existing source
+      - name: Checkout prior successful source branch
+        uses: actions/checkout@v4
+        with:
+          ref: build-stock-save-fix
+      - name: Reconstruct prior successful source
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           import base64, lzma, hashlib
-          parts = sorted(Path('source_parts').glob('part*.b64'))
-          if not parts:
-              raise SystemExit('No source_parts found')
-          joined = ''.join(p.read_text(encoding='ascii').strip() for p in parts)
+          names = [Path('src/source_payload.b64')] + [Path(f'src/cont{i:03}.b64') for i in range(14)]
+          missing = [str(p) for p in names if not p.exists()]
+          if missing:
+              raise SystemExit('Missing source chunks: ' + ', '.join(missing))
+          joined = ''.join(p.read_text(encoding='ascii').strip() for p in names)
           raw = lzma.decompress(base64.b64decode(joined))
           Path('existing_penc_source.py').write_bytes(raw)
-          print('parts:', len(parts))
           print('size:', len(raw))
           print('sha256:', hashlib.sha256(raw).hexdigest())
           PY
