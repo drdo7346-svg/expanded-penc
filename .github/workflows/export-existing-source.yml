@@ -17,42 +17,32 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: build-final-editor-v9
-      - name: Diagnose final delta payload
+      - name: Inspect valid delta prefix
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
           import base64, lzma, hashlib
-          files = sorted(Path('delta_parts').glob('part*.b64')) + sorted(Path('delta_tail').glob('tail*.b64'))
-          print('FILES:', [str(p) for p in files])
-          packed_parts=[]
+          files=sorted(Path('delta_parts').glob('part*.b64'))
+          good=[]
           for p in files:
-              b64=p.read_text(encoding='ascii').strip()
-              piece=base64.b64decode(b64)
-              print(p, 'b64=', len(b64), 'decoded=', len(piece), 'sha=', hashlib.sha256(piece).hexdigest())
-              packed_parts.append(piece)
-          packed=b''.join(packed_parts)
-          print('PACKED SIZE:', len(packed))
-          print('PACKED SHA256:', hashlib.sha256(packed).hexdigest())
-          print('PACKED HEAD:', packed[:32].hex())
-          raw = lzma.decompress(packed)
-          print('RAW SIZE:', len(raw))
-          print('RAW SHA256:', hashlib.sha256(raw).hexdigest())
-          print('RAW HEAD REPR:', repr(raw[:500]))
-          print('RAW TAIL REPR:', repr(raw[-500:]))
+              s=p.read_text(encoding='ascii').strip()
+              try:
+                  b=base64.b64decode(s, validate=True)
+              except Exception as e:
+                  print('FIRST BAD:', p, 'len=', len(s), type(e).__name__, str(e))
+                  break
+              print('GOOD:', p, 'len=', len(s), 'decoded=', len(b), 'sha=', hashlib.sha256(b).hexdigest())
+              good.append(b)
+          packed=b''.join(good)
+          print('PREFIX PACKED SIZE:', len(packed))
+          d=lzma.LZMADecompressor()
+          raw=d.decompress(packed)
+          print('PREFIX RAW SIZE:', len(raw), 'eof=', d.eof)
+          print('RAW HEAD REPR:', repr(raw[:1000]))
+          print('RAW TAIL REPR:', repr(raw[-1000:]))
           try:
-              txt = raw.decode('utf-8')
-              print('UTF8: YES')
-              print('FIRST LINES:')
-              print('\n'.join(txt.splitlines()[:20]))
+              print('RAW HEAD TEXT:', raw[:2000].decode('utf-8'))
           except Exception as e:
-              print('UTF8: NO', type(e).__name__, str(e))
-          Path('final_delta_raw.bin').write_bytes(raw)
+              print('RAW NOT UTF8:', type(e).__name__, str(e))
           PY
-      - name: Upload raw delta
-        uses: actions/upload-artifact@v4
-        with:
-          name: final-delta-raw
-          path: final_delta_raw.bin
-          if-no-files-found: error
-          retention-days: 1
