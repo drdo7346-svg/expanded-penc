@@ -13,48 +13,42 @@ jobs:
   export:
     runs-on: ubuntu-latest
     steps:
-      - name: Restore prior successful source from Git object tree
+      - name: Checkout final editor payload branch
+        uses: actions/checkout@v4
+        with:
+          ref: build-final-editor-v9
+      - name: Diagnose final delta payload
         shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          SOURCE_TREE: 59a5d2606ad214dcea9ccee3b86d85460c82435a
-          SOURCE_SHA256: fea40c9e2cc88063c02397904a7f2401577b488f7682e03022e73f48b8f5fe44
         run: |
           python - <<'PY'
-          import os, json, base64, lzma, hashlib, pathlib, urllib.request
-          repo=os.environ['GITHUB_REPOSITORY']
-          token=os.environ['GITHUB_TOKEN']
-          tree_sha=os.environ['SOURCE_TREE']
-          expected=os.environ['SOURCE_SHA256']
-          headers={
-              'Authorization':f'Bearer {token}',
-              'Accept':'application/vnd.github+json',
-              'X-GitHub-Api-Version':'2022-11-28',
-              'User-Agent':'penc-source-export',
-          }
-          def get_json(url):
-              req=urllib.request.Request(url,headers=headers)
-              with urllib.request.urlopen(req) as r:
-                  return json.load(r)
-          tree=get_json(f'https://api.github.com/repos/{repo}/git/trees/{tree_sha}?recursive=1')
-          blobs={x['path']:x['sha'] for x in tree['tree'] if x.get('type')=='blob'}
-          names=['src/source_payload.b64']+[f'src/cont{i:03}.b64' for i in range(14)]
-          pieces=[]
-          for name in names:
-              obj=get_json(f"https://api.github.com/repos/{repo}/git/blobs/{blobs[name]}")
-              pieces.append(base64.b64decode(obj['content']).decode('ascii').strip())
-          raw=lzma.decompress(base64.b64decode(''.join(pieces)))
-          actual=hashlib.sha256(raw).hexdigest()
-          print('SOURCE SIZE:',len(raw))
-          print('SOURCE SHA256:',actual)
-          if actual != expected:
-              raise SystemExit(f'Source SHA mismatch: {actual}')
-          pathlib.Path('existing_penc_source.py').write_bytes(raw)
+          from pathlib import Path
+          import base64, lzma, hashlib
+          files = sorted(Path('delta_parts').glob('part*.b64')) + sorted(Path('delta_tail').glob('tail*.b64'))
+          print('FILES:', [str(p) for p in files])
+          joined = ''.join(p.read_text(encoding='ascii').strip() for p in files)
+          print('B64 CHARS:', len(joined))
+          packed = base64.b64decode(joined)
+          print('PACKED SIZE:', len(packed))
+          print('PACKED SHA256:', hashlib.sha256(packed).hexdigest())
+          print('PACKED HEAD:', packed[:32].hex())
+          raw = lzma.decompress(packed)
+          print('RAW SIZE:', len(raw))
+          print('RAW SHA256:', hashlib.sha256(raw).hexdigest())
+          print('RAW HEAD REPR:', repr(raw[:500]))
+          print('RAW TAIL REPR:', repr(raw[-500:]))
+          try:
+              txt = raw.decode('utf-8')
+              print('UTF8: YES')
+              print('FIRST LINES:')
+              print('\n'.join(txt.splitlines()[:20]))
+          except Exception as e:
+              print('UTF8: NO', type(e).__name__, str(e))
+          Path('final_delta_raw.bin').write_bytes(raw)
           PY
-      - name: Upload reconstructed source
+      - name: Upload raw delta
         uses: actions/upload-artifact@v4
         with:
-          name: existing-penc-source
-          path: existing_penc_source.py
+          name: final-delta-raw
+          path: final_delta_raw.bin
           if-no-files-found: error
           retention-days: 1
