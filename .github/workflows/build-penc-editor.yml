@@ -1,0 +1,61 @@
+name: Build PenC Expansion Editor EXE
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'PenC_Expansion_Editor_FINAL.py'
+      - '.github/workflows/build-penc-editor.yml'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pillow pyinstaller
+
+      - name: Verify source
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'PenC_Expansion_Editor_FINAL.py')) {
+            throw 'PenC_Expansion_Editor_FINAL.py is missing from repository root.'
+          }
+          python -m py_compile PenC_Expansion_Editor_FINAL.py
+
+      - name: Build standalone Windows EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name PenC_Expansion_Editor_FINAL `
+            PenC_Expansion_Editor_FINAL.py
+
+      - name: Show build output
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse dist
+          Get-FileHash dist\PenC_Expansion_Editor_FINAL.exe -Algorithm SHA256
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PenC_Expansion_Editor_FINAL_Windows
+          path: dist/PenC_Expansion_Editor_FINAL.exe
+          if-no-files-found: error
+          retention-days: 30
