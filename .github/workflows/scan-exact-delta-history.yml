@@ -1,0 +1,153 @@
+name: Scan Exact PenC Delta History
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/scan-exact-delta-history.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout full repository history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all branches and tags
+        shell: bash
+        run: |
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*' --tags --force --prune
+
+      - name: Find exact chunks across historical Git blobs
+        shell: bash
+        env:
+          TARGET_PACKED_SHA256: 1410f50a758429661a470c731ec28a656f58b68cb775415f2fb32f191c51ab11
+          TARGET_PACKED_SIZE: '283948'
+        run: |
+          python - <<'PY'
+          import base64, hashlib, os, subprocess
+          from pathlib import Path
+
+          rows = [
+          (0,9000,'4988f2f1d99f29444383a835934d57a193066b71082acf27690cf37bab0885fa','fd377a585a000004'),
+          (1,9000,'9dc81e81746d84c81ac22d021714a2b579265839380404b93fc13a9104c3576f','85c62b325235d79c'),
+          (2,9000,'0e51f6f5c44dbc175bac7fd5f83666c231160ed27be12f833e08dc6b0a855d0d','b0301f8369aaa07b'),
+          (3,9000,'423f21fcfa47208b21f4b8d691ebfa0e3ed80b22d7f99ad992700b48204f2f17','77d4f0888debbd0f'),
+          (4,9000,'c0ab8f25c8d5e5802f9662f5ec8baeaf6080b06d81f1ebc5a5f698bc6aa6f27b','722599786e9e338c'),
+          (5,9000,'b53a898e9e71eca9ede868587ddd4359fe979a7cefa541991da2a0e374fca80d','7e6b21afd0bfc889'),
+          (6,9000,'ad1a6101b30115b3041bf06bfa7a71a3347a9825b46c34e3c54ea7a1e176f408','3c9765d7f0543945'),
+          (7,9000,'47cac17d7b08c101714dc901c1b49980ab5f182f7c1d71c1ac6b9f1894f9a5cd','427f632b20b0b333'),
+          (8,9000,'84ae00fa4005b26e1518292d80a5d991e1e19f0292f7d988d9966c56c8c6f2ed','17bd066306eb43c1'),
+          (9,9000,'2d6e41837763e266f2182e8201eeccef4651caf8ad640aac3d24cc4224549487','adefc36fc96aefa0'),
+          (10,9000,'4ba7710bdf749d5606193f03e72ef3e2385bbf1e32e2be23c9cb828c85b987a3','672c73b3a6556b4b'),
+          (11,9000,'be82094e04aefba3a75bc1e9cbde5fea4a1b28288163d6e8896538c45bc318fc','c0b5ed4a3379d5a9'),
+          (12,9000,'79b1d8598b8245efe70dcb8becf0ba0b750ea953acd9bbc7d6c6154b627b8449','099836969d188450'),
+          (13,9000,'c3cd6dadda8d2de4c6af999db9c4d40b0377296175b841920a7e569ffd786f39','1276423132082e34'),
+          (14,9000,'d16d5848f0f3825bb0c8357f9e54ff116763c5d3e7ad6d9c5d543a09b0c80785','99537f0a2868f9e0'),
+          (15,9000,'4832c0e27638a9f6fd136790d4556977837d56f3133ab54f41f9351de7c2f186','3705f178485a8c53'),
+          (16,9000,'1043728b6a1f649203427ba3b37f7402f706a2959b006cc744e366b47177bf9d','1f2db9c6adcd202c'),
+          (17,9000,'233d955bd79118c6ec0c31a685bdb0e28d07612e2c21d293c667a6795e35bc66','fd94177372472e8c'),
+          (18,9000,'59916ba805fac36cbc2be788faaedebf772c72a822565b85cef9bf3e2948bdc7','12b58ab7ff9992d7'),
+          (19,9000,'c5f8c5c954798546f4e0f9e528f02c69510ef02e570139aee8d0927b4ff4f30e','954a21e28914ec74'),
+          (20,9000,'7ac409779bf5bf26dc6d7ab1d84d17c7eb18f559ce713739a2c17d83b10dcb4d','88e032f91cbdfa1f'),
+          (21,9000,'e2a75e03d490cc7270b4421be198704c25ffbb64fa7b769253117fde2ee7ef91','de819b54e8953fbc'),
+          (22,9000,'a3d8acbf0bb0bade4784484fe8a635eedd8a570ee034ca22d95af0c7930048f7','4bb310ca6356b63f'),
+          (23,9000,'ec78117039581775b62a6b5349b83571c22e8ac744366d92ccaf47223d07cbc5','1f33bd69916d7d8f'),
+          (24,9000,'bd45d1c84faa7e107a104a0cd5cb6050d94f3bdf55d38d228a06e20f1ea20b26','166446981418ddd0'),
+          (25,9000,'94e26024628c7e609a0893126f0177ce526af4ca059695eb7df3a68655afb854','e1dc99fdf1608501'),
+          (26,9000,'3bb3f42533a91139659ed50f060b1003e97fc597e6157a59e108ec5ac26f5e4d','4ccd035ef4d09130'),
+          (27,9000,'8b3ce53e2e354a1fe61323d496d7d3443b88f84870e06b00e043a576f7ed8f20','eaf622a648ed4a1e'),
+          (28,9000,'9dd48db9c6ea2fb2de87b5842ff01ae3e871f6579cc967da88eaa16956b30030','25676ed3bcf350c3'),
+          (29,9000,'ecfbf94281c05c8cec5d5a8d4859d1a0d3cbaa08893323cb68be982a701401eb','ecf1caacdef98235'),
+          (30,9000,'186c34a4835d3e007abf702583003b8f5ed5d0f3aa3179981284f491b4e29fa5','773fd259f2d76d30'),
+          (31,4948,'4afd2187b6af46055f9df06cfeff7355217fa723d1c1e23c6f3b751d0e0e3f4c','f5400dbbe1bfda42'),
+          ]
+          targets={i:{'size':n,'sha':sha,'head':bytes.fromhex(head)} for i,n,sha,head in rows}
+          found={}
+          provenance={}
+
+          def inspect(data,label):
+              if len(data)==int(os.environ['TARGET_PACKED_SIZE']) and hashlib.sha256(data).hexdigest()==os.environ['TARGET_PACKED_SHA256']:
+                  Path('final_delta_v10_history_recovered.xz').write_bytes(data)
+                  print('FOUND COMPLETE EXACT XZ:',label)
+                  raise SystemExit(77)
+              for i,t in targets.items():
+                  if i in found: continue
+                  start=0
+                  while True:
+                      pos=data.find(t['head'],start)
+                      if pos<0: break
+                      seg=data[pos:pos+t['size']]
+                      if len(seg)==t['size'] and hashlib.sha256(seg).hexdigest()==t['sha']:
+                          found[i]=seg; provenance[i]=(label,pos)
+                          print(f'FOUND CHUNK {i:02d} in {label} at {pos} len={len(seg)}')
+                          break
+                      start=pos+1
+
+          lines=subprocess.check_output(['git','rev-list','--objects','--all'],text=True,errors='replace').splitlines()
+          objects=[]; seen=set()
+          for line in lines:
+              parts=line.split(' ',1)
+              sha=parts[0]; path=parts[1] if len(parts)>1 else ''
+              low=path.lower()
+              if sha in seen: continue
+              if not any(k in low for k in ('delta','patch','payload')): continue
+              if not low.endswith(('.b64','.xz','.bin','.json','.dat')): continue
+              seen.add(sha); objects.append((sha,path))
+          print('CANDIDATE HISTORICAL BLOBS:',len(objects))
+
+          try:
+              for idx,(sha,path) in enumerate(objects,1):
+                  try:
+                      size=int(subprocess.check_output(['git','cat-file','-s',sha],text=True).strip())
+                  except Exception: continue
+                  if size>2_000_000: continue
+                  try:
+                      data=subprocess.check_output(['git','cat-file','-p',sha])
+                  except Exception: continue
+                  inspect(data,f'raw:{path}@{sha[:10]}')
+                  if path.lower().endswith('.b64'):
+                      try:
+                          s=b''.join(data.split()).decode('ascii')
+                          # only decode syntactically plausible streams
+                          if len(s)%4==1:
+                              continue
+                          dec=base64.b64decode(s + '='*((-len(s))%4),validate=False)
+                          inspect(dec,f'b64:{path}@{sha[:10]}')
+                      except Exception:
+                          pass
+                  if idx%100==0: print('SCANNED',idx,'/',len(objects),'FOUND',sorted(found))
+          except SystemExit as e:
+              if e.code==77:
+                  pass
+              else: raise
+
+          outpath=Path('final_delta_v10_history_recovered.xz')
+          if not outpath.exists():
+              print('FOUND INDEXES:',sorted(found))
+              print('MISSING INDEXES:',[i for i in targets if i not in found])
+              for i in sorted(provenance): print('PROVENANCE',i,provenance[i])
+              if len(found)==len(targets):
+                  out=b''.join(found[i] for i in range(len(targets)))
+                  print('ASSEMBLED SIZE',len(out),'SHA',hashlib.sha256(out).hexdigest())
+                  if len(out)==int(os.environ['TARGET_PACKED_SIZE']) and hashlib.sha256(out).hexdigest()==os.environ['TARGET_PACKED_SHA256']:
+                      outpath.write_bytes(out)
+              if not outpath.exists():
+                  raise SystemExit('Historical scan did not yet recover every exact chunk')
+
+          print('RECOVERED EXACT XZ SIZE',outpath.stat().st_size,'SHA',hashlib.sha256(outpath.read_bytes()).hexdigest())
+          PY
+
+      - name: Upload recovered exact delta
+        uses: actions/upload-artifact@v4
+        with:
+          name: final_delta_v10_history_recovered
+          path: final_delta_v10_history_recovered.xz
+          if-no-files-found: error
+          retention-days: 1
