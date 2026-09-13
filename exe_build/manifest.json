@@ -1,0 +1,63 @@
+{
+  "source_name": "PenC_Expansion_Editor_Godzilla_BattleFix.py",
+  "source_sha256": "d512ec3cdcafc9085d329b1777ce5ded46f8f21a3e338d8b48250f9b75a612b9",
+  "source_size": 4670385,
+  "packed_sha256": "80e5911eacff88746ef0dfb7cece8b57af293410934931d22083e0f098afcd41",
+  "parts": [
+    {
+      "path": "payload/part000.b64",
+      "size": 49152,
+      "sha256": "899da36099102782efd0fe00416de7c93720f059bd0c4248ff1163adda83c893"
+    },
+    {
+      "path": "payload/part001.b64",
+      "size": 49152,
+      "sha256": "7c95f01f50bad04c1183c5f054d02c5b7bdddc698cf63cb37580c3f5ae54f6ed"
+    },
+    {
+      "path": "payload/part002.b64",
+      "size": 49152,
+      "sha256": "17dfcc871f42183f47cdfc67b4a701dcd522b1f6fab40b003d6387fe9c8a9e99"
+    },
+    {
+      "path": "payload/part003.b64",
+      "size": 49152,
+      "sha256": "87ab5c06d7423e6e1f04cf690db0aa24350ee644a2f1b54fb24b505866c7fb6f"
+    },
+    {
+      "path": "payload/part004.b64",
+      "size": 49152,
+      "sha256": "f6e73b35abb410c2f4a0347a85991fbf8fc5f729d41144c19ba2176f4d0cd7dc"
+    },
+    {
+      "path": "payload/part005.b64",
+      "size": 49152,
+      "sha256": "ebd3e21fe40c14dc3f1766dfa61561e571c8ee206291e7ccd6c464ec4b26cd95"
+    },
+    {
+      "path": "payload/part006.b64",
+      "size": 49152,
+      "sha256": "bc8894b2471e0190e2af5eff6ff303eb84f00d1735d0d9faf65837a5612829e3"
+    },
+    {
+      "path": "payload/part007.b64",
+      "size": 49152,
+      "sha256": "64de63c6eb0b1909e38e52a7ab3eff920af33e7acb8d48a206e958509e0a9a56"
+    },
+    {
+      "path": "payload/part008.b64",
+      "size": 49152,
+      "sha256": "717c62dee5df21bf5134515d04f79c1c2d25d5bcc11ee3cb94f97d2fcefd9fae"
+    },
+    {
+      "path": "payload/part009.b64",
+      "size": 49152,
+      "sha256": "73bea6e880d5197b37850c0cf4739446d0c7d30eda064dc8fc6d62eda8863edd"
+    },
+    {
+      "path": "payload/part010.b64",
+      "size": 33120,
+      "sha256": "c2f291273e1b117f5d655558f094e8adef77d1584b4d2f5ba78772115221e760"
+    }
+  ]
+}
