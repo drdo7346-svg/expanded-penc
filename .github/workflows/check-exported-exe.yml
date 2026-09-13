@@ -1,0 +1,45 @@
+name: Verify exact downloadable PenC EXE
+on:
+  push:
+    branches: ['codex/windows-exe-20260913']
+    paths: ['.github/workflows/check-exported-exe.yml', 'verification/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.10'
+          architecture: 'x64'
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 34738818924
+          name: PenC_Expansion_Editor_Windows_x64
+          path: exe_build/dist
+      - name: Verify exact delivered binary
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash exe_build/dist/PenC_Expansion_Editor.exe -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne 'a24bf09571d07da27f87efffba774cfb4ac5a8f7f7dfd0f6c9c17ef52fe01a26') { throw 'EXE checksum mismatch' }
+      - name: Install test driver dependencies
+        run: python -m pip install pillow==12.1.1 psutil==7.2.2
+      - name: Test exact EXE with native menus and dialogs
+        run: python verification/check_exported_exe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: PenC_Exact_EXE_Windows_Verification
+          path: |
+            exe_build/windows-smoke.json
+            exe_build/windows-gui.png
+          if-no-files-found: warn
+          retention-days: 30
+
