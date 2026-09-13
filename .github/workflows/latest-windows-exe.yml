@@ -21,6 +21,14 @@ jobs:
           architecture: 'x64'
       - name: Reconstruct and verify unchanged latest source
         run: python exe_build/scripts/prepare.py
+      - name: Set up verified executable compressor
+        shell: pwsh
+        run: |
+          Invoke-WebRequest 'https://github.com/upx/upx/releases/download/v5.2.1/upx-5.2.1-win64.zip' -OutFile upx.zip
+          $hash = (Get-FileHash upx.zip -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne 'eabc6792a347d45e945be7748423e7868fd01b0d2bcaa2f4b1031fd71ff69bda') { throw 'UPX checksum mismatch' }
+          Expand-Archive upx.zip -DestinationPath build-tools
+          "PENC_UPX_DIR=$((Resolve-Path 'build-tools/upx-5.2.1-win64').Path)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Clean build environment with runtime dependencies only
         shell: pwsh
         run: |
