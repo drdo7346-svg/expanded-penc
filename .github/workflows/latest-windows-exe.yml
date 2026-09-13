@@ -44,13 +44,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
       - name: Verify every original code object and required runtime
         run: ./build-venv/Scripts/python.exe exe_build/scripts/audit_bundle.py
-      - name: Test the actual Windows executable
-        shell: pwsh
-        run: |
-          ./build-venv/Scripts/python.exe -m pip install --disable-pip-version-check psutil==7.2.2
-          ./build-venv/Scripts/python.exe exe_build/scripts/smoke_windows.py
-          if ($LASTEXITCODE -ne 0) { throw 'Windows EXE smoke test failed' }
-      - name: Upload verified executable
+      - name: Upload executable after complete-code verification
         uses: actions/upload-artifact@v4
         with:
           name: PenC_Expansion_Editor_Windows_x64
@@ -58,6 +52,12 @@ jobs:
           compression-level: 0
           if-no-files-found: error
           retention-days: 30
+      - name: Test the actual Windows executable
+        shell: pwsh
+        run: |
+          ./build-venv/Scripts/python.exe -m pip install --disable-pip-version-check psutil==7.2.2
+          ./build-venv/Scripts/python.exe exe_build/scripts/smoke_windows.py
+          if ($LASTEXITCODE -ne 0) { throw 'Windows EXE smoke test failed' }
       - name: Upload verification evidence
         if: always()
         uses: actions/upload-artifact@v4
