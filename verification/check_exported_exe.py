@@ -137,8 +137,15 @@ try:
     filemenu = u.GetSubMenu(menu, file_index)
     file_rows = menu_rows(filemenu)
     print("File menu:", ascii(file_rows), flush=True)
-    open_rom = next(row for row in file_rows if "ROM" in row[1]
-                    and ("열기" in row[1] or "Open" in row[1]))
+    matches = [row for row in file_rows if "ROM" in row[1]
+               and ("열기" in row[1] or "Open" in row[1])]
+    if matches:
+        open_rom = matches[0]
+    else:
+        # Tk draws popup-menu text itself, so GetMenuString may be empty.
+        # The verified precompilefinal__GUI._build_menu puts Open ROM first.
+        assert file_rows and all(not row[1] for row in file_rows), file_rows
+        open_rom = file_rows[0]
     u.PostMessageW(hwnd, 0x111, open_rom[2], 0)
     dialog = wait_for(lambda: next((h for h, title, cls in windows()
                                    if cls == "#32770"), None))
