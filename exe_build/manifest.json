@@ -1,8 +1,8 @@
 {
-  "source_name": "PenC_Expansion_Editor_Godzilla_BattleFix.py",
-  "source_sha256": "d512ec3cdcafc9085d329b1777ce5ded46f8f21a3e338d8b48250f9b75a612b9",
-  "source_size": 4670385,
-  "packed_sha256": "80e5911eacff88746ef0dfb7cece8b57af293410934931d22083e0f098afcd41",
+  "source_name": "PenC_Expansion_Editor.py",
+  "source_sha256": "db75c582e92151cffe8c2ea09c88d52f7366677e60b544dff40373abac9ac591",
+  "source_size": 4981740,
+  "packed_sha256": "940f452eb3fb6f04fb826ab725624566cc484ce91771c9df9625f2a2371d413d",
   "parts": [
     {
       "path": "payload/part000.b64",
@@ -47,17 +47,42 @@
     {
       "path": "payload/part008.b64",
       "size": 49152,
-      "sha256": "717c62dee5df21bf5134515d04f79c1c2d25d5bcc11ee3cb94f97d2fcefd9fae"
+      "sha256": "1fd6ccc305bc8adf68f0f981c18f7cd435e47ee37ec4f07488e4a74b35110d0d"
     },
     {
       "path": "payload/part009.b64",
       "size": 49152,
-      "sha256": "73bea6e880d5197b37850c0cf4739446d0c7d30eda064dc8fc6d62eda8863edd"
+      "sha256": "1048a55a1cc667e59fb1b7bf2c2a55fb7ec0a54604d13c68764123b7d81e96d7"
     },
     {
       "path": "payload/part010.b64",
-      "size": 33120,
-      "sha256": "c2f291273e1b117f5d655558f094e8adef77d1584b4d2f5ba78772115221e760"
+      "size": 49152,
+      "sha256": "3b57c15b2f34dd078ca77fa4bb85b91475dcd63c2b203f90f2c515db2308596e"
+    },
+    {
+      "path": "payload/part011.b64",
+      "size": 49152,
+      "sha256": "945100ab3109fa41fd1ffc3ad785de4c79067a49821d2c4f9ade461c50f58643"
+    },
+    {
+      "path": "payload/part012.b64",
+      "size": 49152,
+      "sha256": "f5d9a40c7bfc8d2fd77159187279babc41621da1995e2e38c5bae73ab0c57969"
+    },
+    {
+      "path": "payload/part013.b64",
+      "size": 49152,
+      "sha256": "0ebf4223520388b8263dee873fc437a40b631a54bf30f1dcead6b3ed2127f3ab"
+    },
+    {
+      "path": "payload/part014.b64",
+      "size": 49152,
+      "sha256": "6b6e8534255c08af95c27c33c0ef8dad2be2c53a18de5cf1383e409472c665f9"
+    },
+    {
+      "path": "payload/part015.b64",
+      "size": 21288,
+      "sha256": "ffcbb38618f4de2db4cf1e75d77e79c5f1ac5fc1cd16e03d659d45e4b320f196"
     }
   ]
 }

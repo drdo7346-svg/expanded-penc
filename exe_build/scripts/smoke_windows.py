@@ -128,11 +128,24 @@ try:
     print("PASS GUI and Credits dialog:", ascii(texts), flush=True)
     close_dialog(dialog)
     wait_for(lambda: not any(x[0] == dialog for x in windows()))
+    # Tk may rebuild its native HMENU after a modal dialog returns.
+    # Reacquire it instead of using a stale Windows handle.
+    time.sleep(.3)
+    menu = u.GetMenu(hwnd)
+    rows = menu_rows(menu)
     file_index = next(row[0] for row in rows if row[1] in ("파일", "File"))
     filemenu = u.GetSubMenu(menu, file_index)
     file_rows = menu_rows(filemenu)
-    open_rom = next(row for row in file_rows if row[1].split("\t")[0]
-                    in ("ROM 열기...", "Open ROM..."))
+    print("File menu:", ascii(file_rows), flush=True)
+    matches = [row for row in file_rows if "ROM" in row[1]
+               and ("열기" in row[1] or "Open" in row[1])]
+    if matches:
+        open_rom = matches[0]
+    else:
+        # Tk draws popup-menu text itself, so GetMenuString may be empty.
+        # The verified precompilefinal__GUI._build_menu puts Open ROM first.
+        assert file_rows and all(not row[1] for row in file_rows), file_rows
+        open_rom = file_rows[0]
     u.PostMessageW(hwnd, 0x111, open_rom[2], 0)
     dialog = wait_for(lambda: next((h for h, title, cls in windows()
                                    if cls == "#32770"), None))
@@ -158,4 +171,3 @@ finally:
             try: child.kill()
             except psutil.Error: pass
         proc.kill()
-
