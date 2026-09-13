@@ -47,6 +47,9 @@ u.GetMenuStringW.argtypes = [W.HMENU, W.UINT, W.LPWSTR, ctypes.c_int, W.UINT]
 u.GetMenuItemID.argtypes = [W.HMENU, ctypes.c_int]; u.GetMenuItemID.restype = W.UINT
 u.PostMessageW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM]
 u.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
+u.GetDlgItem.argtypes = [W.HWND, ctypes.c_int]; u.GetDlgItem.restype = W.HWND
+u.SetActiveWindow.argtypes = [W.HWND]; u.SetActiveWindow.restype = W.HWND
+u.SetForegroundWindow.argtypes = [W.HWND]
 
 
 def caption(hwnd, class_name=False):
@@ -94,6 +97,17 @@ def menu_rows(menu):
     return rows
 
 
+def click_dialog_button(dialog, button_id):
+    # Current Windows Tk uses TaskDialogIndirect for message boxes. A bare
+    # WM_COMMAND does not simulate a task-dialog button click.
+    button = u.GetDlgItem(dialog, button_id)
+    u.SetForegroundWindow(dialog)
+    if button:
+        u.PostMessageW(button, 0xF5, 0, 0)  # BM_CLICK: real button notification
+    else:
+        u.PostMessageW(dialog, 0x466, button_id, 0)  # TDM_CLICK_BUTTON
+
+
 try:
     hwnd = wait_for(lambda: next((h for h, title, cls in windows()
                                  if cls == "TkTopLevel" and u.GetMenu(h)), None))
@@ -115,7 +129,8 @@ try:
         return True
     u.EnumChildWindows(dialog, collect_text, 0)
     assert "By DrDo" in texts, texts
-    u.PostMessageW(dialog, 0x111, 1, 0)
+    print("PASS GUI and Credits dialog:", repr(texts), flush=True)
+    click_dialog_button(dialog, 1)
     wait_for(lambda: not any(x[0] == dialog for x in windows()))
     file_index = next(row[0] for row in rows if row[1] in ("파일", "File"))
     filemenu = u.GetSubMenu(menu, file_index)
@@ -125,7 +140,7 @@ try:
     u.PostMessageW(hwnd, 0x111, open_rom[2], 0)
     dialog = wait_for(lambda: next((h for h, title, cls in windows()
                                    if cls == "#32770"), None))
-    u.PostMessageW(dialog, 0x111, 2, 0)
+    click_dialog_button(dialog, 2)
     wait_for(lambda: not any(x[0] == dialog for x in windows()))
     rect = W.RECT(); u.GetWindowRect(hwnd, ctypes.byref(rect))
     ImageGrab.grab().crop((rect.left, rect.top, rect.right, rect.bottom)).save(root / "windows-gui.png")
