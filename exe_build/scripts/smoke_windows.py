@@ -25,7 +25,7 @@ env.pop("PYTHONPATH", None)
 env.pop("TCL_LIBRARY", None)
 env.pop("TK_LIBRARY", None)
 # The bundled runtime must work even when installed Python is absent from PATH.
-env["PATH"] = str(Path(env["SystemRoot"]) / "System32")
+env["PATH"] = str(Path(os.environ["SYSTEMROOT"]) / "System32")
 cli = []
 for arg, expected in (("--validate-release", 0), ("--layout", 0), ("--invalid-option", 2)):
     result = subprocess.run([str(exe), arg], cwd=cwd, env=env, timeout=90)

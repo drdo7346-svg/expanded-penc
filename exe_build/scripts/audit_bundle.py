@@ -68,6 +68,7 @@ result = {
     "tk_tcl_korean_encoding_present": True,
     "pillow_modules": sorted(p for p in archive.toc if p.startswith("PIL.")),
     "archive_members": entries,
+    "archive_sizes": {name: list(row) for name, row in reader.toc.items()},
     "optimization_level": 0,
     "external_python_installation_required": False,
 }
