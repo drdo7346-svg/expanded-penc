@@ -97,15 +97,11 @@ def menu_rows(menu):
     return rows
 
 
-def click_dialog_button(dialog, button_id):
-    # Current Windows Tk uses TaskDialogIndirect for message boxes. A bare
-    # WM_COMMAND does not simulate a task-dialog button click.
-    button = u.GetDlgItem(dialog, button_id)
-    u.SetForegroundWindow(dialog)
-    if button:
-        u.PostMessageW(button, 0xF5, 0, 0)  # BM_CLICK: real button notification
-    else:
-        u.PostMessageW(dialog, 0x466, button_id, 0)  # TDM_CLICK_BUTTON
+def close_dialog(dialog):
+    # Closing the window is a native cancel/OK path that does not require
+    # an interactive mouse or foreground-input permission on a CI desktop.
+    if not u.PostMessageW(dialog, 0x10, 0, 0):  # WM_CLOSE
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 try:
@@ -129,8 +125,8 @@ try:
         return True
     u.EnumChildWindows(dialog, collect_text, 0)
     assert "By DrDo" in texts, texts
-    print("PASS GUI and Credits dialog:", repr(texts), flush=True)
-    click_dialog_button(dialog, 1)
+    print("PASS GUI and Credits dialog:", ascii(texts), flush=True)
+    close_dialog(dialog)
     wait_for(lambda: not any(x[0] == dialog for x in windows()))
     file_index = next(row[0] for row in rows if row[1] in ("파일", "File"))
     filemenu = u.GetSubMenu(menu, file_index)
@@ -140,7 +136,7 @@ try:
     u.PostMessageW(hwnd, 0x111, open_rom[2], 0)
     dialog = wait_for(lambda: next((h for h, title, cls in windows()
                                    if cls == "#32770"), None))
-    click_dialog_button(dialog, 2)
+    close_dialog(dialog)
     wait_for(lambda: not any(x[0] == dialog for x in windows()))
     rect = W.RECT(); u.GetWindowRect(hwnd, ctypes.byref(rect))
     ImageGrab.grab().crop((rect.left, rect.top, rect.right, rect.bottom)).save(root / "windows-gui.png")
