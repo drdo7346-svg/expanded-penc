@@ -3,6 +3,8 @@ name: Build PenC Windows EXE
 on:
   push:
     branches: [chatgpt-build-exe]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
