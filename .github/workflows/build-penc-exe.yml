@@ -1,0 +1,59 @@
+name: Build PenC Windows EXE
+
+on:
+  push:
+    branches: [chatgpt-build-exe]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Reconstruct source
+        shell: pwsh
+        run: |
+          @'
+          import base64, gzip, hashlib
+          from pathlib import Path
+          parts = []
+          for p in sorted(Path(".chatgpt_build").glob("payload_*.b64")):
+              parts.append(p.read_text(encoding="ascii").strip())
+          raw = gzip.decompress(base64.b64decode("".join(parts)))
+          digest = hashlib.sha256(raw).hexdigest()
+          expected = "e648338ecd7cec1b453ade82df4f54e79d39939ea95909a9f4c1027774458dcc"
+          if digest != expected:
+              raise SystemExit(f"source hash mismatch: {digest} != {expected}")
+          Path("PenC_Expansion_Editor_516_FULL_SIGNAL_CAPACITY.py").write_bytes(raw)
+          print("source bytes:", len(raw))
+          print("sha256:", digest)
+          '@ | python -
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check pyinstaller pillow
+
+      - name: Build EXE
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --noupx --name PenC_Expansion_Editor PenC_Expansion_Editor_516_FULL_SIGNAL_CAPACITY.py
+          if (!(Test-Path "dist\PenC_Expansion_Editor.exe")) { throw "EXE was not generated" }
+          Get-FileHash "dist\PenC_Expansion_Editor.exe" -Algorithm SHA256
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: PenC_Expansion_Editor_Windows
+          path: dist/PenC_Expansion_Editor.exe
+          if-no-files-found: error
+          retention-days: 7
