@@ -1,0 +1,4996 @@
+"""PenC Expansion Editor.
+
+Entry points and feature owners
+------------------------------
+* GUI / release__main: desktop editor and command-line entry point.
+* compact8__create_project_from_rom / modrom__restore_project_from_rom:
+  stock and edited ROM loading, including native sprite dimensions.
+* release__load_project / release__save_project: project and asset persistence.
+* precompilefinal__full_build_validation: validated 8 MiB ROM assembly.
+* dmclbw__build_rom: final common-sprite, egg, startup, battle, backup and
+  sleep-display integration, followed by the reserved-space audit.
+* penc67__prepare_export: Wave 1/2, Wave 3 and Godzilla hardware conversion.
+* romspace__: reservations for 516 Digimon, 100 quests, 100 special Jogress
+  routes, 25 eggs and the four-backup save format.
+* polished__GUI / polish__tab_content: final wording and scrollable controls.
+
+Captured builder aliases and class inheritance preserve the verified patch
+order. Keep their assignments in sequence. Binary offsets, old metadata keys
+and protocol identifiers are compatibility contracts, not interface labels.
+"""
+
+from __future__ import annotations
+
+
+import argparse
+import base64
+import copy
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import sys
+import tempfile
+import traceback
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Any, Iterable, Optional
+
+def runtime__show_error(title, message, parent=None, *, gui=True):
+    """Show an error even when the desktop runtime cannot start."""
+    temporary_root = None
+    if gui:
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+
+            if parent is None:
+                temporary_root = tk.Tk()
+                temporary_root.withdraw()
+                parent = temporary_root
+            # This message already has an explicit Korean/English branch.
+            # Bypass legacy global translators so details and paths stay intact.
+            original = globals().get("engine___DIALOG_ORIGINALS", {}).get(
+                (messagebox.__name__, "showerror"), messagebox.showerror
+            )
+            original(title, message, parent=parent)
+            return
+        except Exception:
+            # Missing Tcl/Tk, no display, or an already destroyed window.
+            pass
+        finally:
+            if temporary_root is not None:
+                try:
+                    temporary_root.destroy()
+                except Exception:
+                    pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                ctypes.windll.user32.MessageBoxW(None, str(message), str(title), 0x10)
+                return
+            except Exception:
+                pass
+    stream = sys.stderr or sys.__stderr__ or sys.stdout or sys.__stdout__
+    if stream is not None:
+        try:
+            print(f"{title}: {message}", file=stream)
+        except Exception:
+            # Some Windows console encodings cannot represent the Korean text.
+            try:
+                encoded = f"{title}: {message}\n".encode(
+                    getattr(stream, "encoding", None) or "utf-8", errors="backslashreplace"
+                )
+                stream.buffer.write(encoded)
+                stream.buffer.flush()
+            except Exception:
+                pass
+
+
+runtime__PIL_IMPORT_ERROR = None
+try:
+    from PIL import Image, UnidentifiedImageError
+except (ImportError, OSError) as exc:
+    # Static CLI checks do not decode images. Delay the GUI requirement until
+    # main() so --help/--layout/--validate-release remain available.
+    Image = None
+    UnidentifiedImageError = None
+    runtime__PIL_IMPORT_ERROR = exc
+core__ROM_SIZE = 8388608
+core__BANK1 = 4194304
+core__SAVE_TAIL = 8376320
+core__ROSTER_COUNT = 45
+core__MAX_ID = core__ROSTER_COUNT - 1
+core__ORIGINAL_ROSTER_COUNT = 32
+core__ADDED_ROSTER_COUNT = core__ROSTER_COUNT - core__ORIGINAL_ROSTER_COUNT
+core__FRAMES_PER_DIGIMON = 12
+core__VANILLA_IMAGE_COUNT = 759
+core__FINAL_IMAGE_COUNT = (
+    core__VANILLA_IMAGE_COUNT + core__ADDED_ROSTER_COUNT * core__FRAMES_PER_DIGIMON
+)
+core__NO_RESULT_ID = core__ROSTER_COUNT
+core__ORIGINAL_SIZE_TABLE = 64796
+core__RELOCATED_SIZE_TABLE = 188928
+core__ORIGINAL_STAT_TABLE = 131390
+core__FINAL_STAT_TABLE = 176128
+core__STAT_RECORD_SIZE = 36
+core__STAT_WORD_COUNT = core__STAT_RECORD_SIZE // 2
+core__STAT_LOOKUP_SITE = 133654
+core__CUTIN_FLAG = 188416
+core__METADATA_OFFSET = 184320
+core__METADATA_SIZE = 4096
+core__ALBUM_HOOK = 21886
+core__ALBUM_RETURN = 21890
+core__ALBUM_CAVE = 168832
+core__ALBUM_VISIBILITY_FUNCTION = 46692
+core__ALBUM_VISIBILITY_FUNCTION_END = 46774
+core__ALBUM_VISIBILITY_CAVE = 167936
+core__ALBUM_VISIBILITY_ORIGINAL_COPY = 168064
+core__ALBUM_VISIBILITY_CAVE_END = 168320
+core__LOCK_IMAGE_ID = 740
+core__EVO_HOOK = 48218
+core__EVO_HOOK_RETURN = 48224
+core__EVO_RESULT_RETURN = 48778
+core__EVO_CAVE = 169024
+core__EVO_CAVE_END = 172032
+core__JOGRESS_STAGE_MISMATCH_SITE = 3712
+core__JOGRESS_POINTER_LOAD_SITE = 3720
+core__JOGRESS_POINTER_TABLE = 128000
+core__JOGRESS_ROWS = 128256
+core__JOGRESS_SPECIAL_HOOK = 3420
+core__JOGRESS_SPECIAL_DATA = 128768
+core__JOGRESS_SPECIAL_END = 130048
+core__ROSTER_MAX_OFFSETS = [
+    3814,
+    15786,
+    21916,
+    21992,
+    31398,
+    33364,
+    40602,
+    46480,
+    46566,
+    46644,
+    49378,
+    50444,
+    50544,
+    50708,
+    120516,
+    133626,
+]
+core__IMAGE_MAX_OFFSETS = [101484, 102646, 123106, 123156]
+core__SIZE_TABLE_ADDRESS_SITES = [101664, 101744, 102808, 102882]
+core__EXPECTED_SHA256 = "0a87352b39c9a93c5b9e0ee53e84a02c35b07021a15b3a2a7c1486f8d96de747"
+core__PROJECT_FORMAT = "PenC1Roste\x7245Project\x565"
+core__LEGACY_PROJECT_FORMATS = {
+    "PenC1Roste\x7245Project\x562",
+    "PenC1Roste\x7245Project\x563",
+    "PenC1Roste\x7245Project\x564",
+}
+core__APP_VERSION = "1.4.0"
+core__DEFAULT_NEW_SLOT_TEMPLATE_ID = 31
+core__MAX_DISPLAY_NAME_LENGTH = 40
+core__ALBUM_ORDER_STAT_INDEX = 13
+core__ALBUM_VISIBLE_STAT_INDEX = 14
+core__DEFAULT_DISPLAY_NAMES = [
+    "Bubbmon",
+    "Mochimon",
+    "Tentomon",
+    "Gottsumon",
+    "Otamamon",
+    "Kabuterimon",
+    "Tortamon",
+    "Monochromon",
+    "Starmon",
+    "Gekomon",
+    "Kuwagamon",
+    "Tailmon",
+    "Atlur Kabuterimon",
+    "Jyagamon",
+    "Triceramon",
+    "Piccolomon",
+    "Tonosama Gekomon",
+    "Okuwamon",
+    "Angewomon",
+    "Herakle Kabuterimon",
+    "Saber Leomon",
+    "Metal Etemon",
+    "Holydramon",
+    "Blastmon",
+    "El Doradimon",
+    "Gran Kuwagamon",
+    "Tlalocmon",
+    "Mastemon",
+    "Angoramon",
+    "Symbare Angoramon",
+    "Lamortmon",
+    "Diarbbitmon",
+]
+core__CONDITION_STAT_ADDRESS = {
+    1: 2089,
+    3: 2091,
+    4: 2092,
+    5: 2093,
+    6: 2094,
+    7: 2095,
+    9: 2098,
+    11: 2100,
+    12: 2101,
+    13: 2123,
+}
+core__CONDITION_NAMES_KO = {
+    0: "항상 (비교 없음)",
+    1: "현재 체중",
+    3: "총 배틀 횟수",
+    4: "현재 세대 배틀 횟수",
+    5: "총 승리 횟수",
+    6: "케어 미스 횟수",
+    7: "부상 횟수",
+    9: "훈련 횟수",
+    11: "특성 알 여부",
+    12: "알 흔들기 여부",
+    13: "최대 퀘스트 단계",
+}
+core__SUPPORTED_CONDITION_KINDS = tuple(core__CONDITION_NAMES_KO)
+core__OPERATOR_SYMBOL = {0: "<=", 1: "<", 2: ">=", 3: ">", 4: "!=", 5: "=="}
+core__OPERATOR_DESCRIPTION_KO = {
+    0: "게임 값이 입력값 이하",
+    1: "게임 값이 입력값 미만",
+    2: "게임 값이 입력값 이상",
+    3: "게임 값이 입력값 초과",
+    4: "게임 값이 입력값과 다름",
+    5: "게임 값이 입력값과 같음",
+}
+core__OPERATOR_INVERSE_BRANCH_HIGH = {0: 158, 1: 142, 2: 14, 3: 30, 4: 94, 5: 78}
+core__STAT_LABELS = [
+    "스프라이트 시작 번호 (자동)",
+    "성장 단계",
+    "속성",
+    "최소 체중",
+    "파워",
+    "취침 시",
+    "취침 분",
+    "기상 시",
+    "기상 분",
+    "배고픔/상태 감소 간격",
+    "진화 시간 (분)",
+    "배변 간격",
+    "조그레스 가능 플래그",
+    "도감 순서 (자동=ID)",
+    "앨범 표시 플래그",
+    "에너지",
+    "하트 인코딩",
+    "필살기 스펙",
+]
+core__STAT_MINIMUMS = [0] * 18
+core__STAT_MAXIMUMS = [
+    65535,
+    6,
+    3,
+    99,
+    255,
+    24,
+    59,
+    24,
+    59,
+    65535,
+    65535,
+    65535,
+    1,
+    65535,
+    1,
+    65535,
+    3,
+    65535,
+]
+core__STAT_DETAILS = [
+    "해당 슬롯의 12개 스프라이트 중 첫 이미지 번호. 생성 시 자동 계산됩니다.",
+    "성장 단계 코드. 기존 에디터 범위 0~6.",
+    "0=프리, 1=바이러스, 2=데이터, 3=백신.",
+    "게임이 사용하는 최소 체중 값.",
+    "전투 기본 파워, 0~255. 훈련 등의 보너스를 더한 최종 파워도 최대 255입니다.",
+    "취침 시(hour). 기존 에디터는 0~24를 허용합니다.",
+    "취침 분(minute), 0~59.",
+    "기상 시(hour). 기존 에디터는 0~24를 허용합니다.",
+    "기상 분(minute), 0~59.",
+    "배고픔/상태가 감소하는 내부 간격 값.",
+    "진화 판정까지의 시간(분).",
+    "배변 발생 내부 간격 값.",
+    "0=NO, 1=YES. 조그레스 가능 여부.",
+    "도감 정렬 순서. 이 도구에서는 슬롯 ID로 자동 고정합니다.",
+    "0=앨범 목록에서 숨김, 1=앨범 목록에 표시. 미획득이면 잠금 이미지, 획득하면 실제 스프라이트가 표시됩니다.",
+    "에너지 관련 내부 값.",
+    "하트 표시 인코딩 0~3.",
+    "필살기 관련 내부 스펙 값.",
+]
+
+
+@dataclass
+class core__RomImage:
+    width: int
+    height: int
+    pixels: bytes
+
+
+@dataclass(frozen=True)
+class core__RomProfileInfo:
+    version: int
+    label: str
+    roster_count: int
+    image_count: int
+    size_table: int
+    stock_sha256: str
+
+
+core__ROM_PROFILES: tuple[core__RomProfileInfo, ...] = (
+    core__RomProfileInfo(
+        0,
+        "PenC0 / VP0",
+        33,
+        771,
+        66158,
+        "710f0ae26c11c42e379c1fa8b4c87c3673b2927cfb23d6efcde30600866a6acf",
+    ),
+    core__RomProfileInfo(
+        1,
+        "PenC1 / VP1",
+        32,
+        759,
+        64796,
+        "0a87352b39c9a93c5b9e0ee53e84a02c35b07021a15b3a2a7c1486f8d96de747",
+    ),
+    core__RomProfileInfo(
+        2,
+        "PenC2 / VP2",
+        32,
+        759,
+        64730,
+        "17700a7aa8f6a7747f0ba3f3dc0f3ec4a1b91fe6176f3bf86c3d9362099f9472",
+    ),
+    core__RomProfileInfo(
+        3,
+        "PenC3 / VP3",
+        32,
+        759,
+        64736,
+        "a15ce4e72847ec7d5d620d99c2d51cd51c73df13bc8eb78d20d590191d60e607",
+    ),
+    core__RomProfileInfo(
+        4,
+        "PenC4 / VP4",
+        32,
+        759,
+        65932,
+        "b8f4e67537805e7d02b7d3e498a9f3cff694880b86576afb9a36241f61f6fe83",
+    ),
+    core__RomProfileInfo(
+        5,
+        "PenC5 / VP5",
+        32,
+        759,
+        65944,
+        "446cfad6d80c8817cb786c441ff27e5c9ce4847b2f7c26174cd3495f2145145d",
+    ),
+)
+core__ROM_PROFILE_BY_HASH = {profile.stock_sha256: profile for profile in core__ROM_PROFILES}
+core__ROM_PROFILE_BY_VERSION = {profile.version: profile for profile in core__ROM_PROFILES}
+
+
+@dataclass
+class core__LoadedSourceRom:
+    path: Path
+    profile: core__RomProfileInfo
+    data: bytes
+    images: list[core__RomImage]
+
+
+@dataclass
+class core__FrameRef:
+
+    kind: str
+    value: int | str
+
+    @classmethod
+    def from_dict(cls, obj: dict[str, Any]) -> "FrameRef":
+        kind = str(obj.get("kind", ""))
+        value = obj.get("value")
+        if kind == "base":
+            value = int(value)
+        elif kind in ("file", "embedded"):
+            value = str(value)
+        else:
+            raise ValueError(f"알 수 없는 frame kind: {kind!r}")
+        return cls(kind, value)
+
+
+@dataclass
+class core__EvolutionCondition:
+    kind: int = 0
+    operator: int = 5
+    value: int = 0
+
+    def validate(self) -> None:
+        if self.kind not in core__SUPPORTED_CONDITION_KINDS:
+            raise ValueError(f"PenC1에서 지원하지 않는 진화 조건 종류: {self.kind}")
+        if self.operator not in core__OPERATOR_SYMBOL:
+            raise ValueError(f"지원하지 않는 비교 연산자: {self.operator}")
+        max_value = 1 if self.kind in (11, 12) else 63
+        if not 0 <= self.value <= max_value:
+            raise ValueError(
+                f"{core__CONDITION_NAMES_KO[self.kind]} 값은 0~{max_value} 범위여야 합니다: {self.value}"
+            )
+
+    @classmethod
+    def from_dict(cls, obj: dict[str, Any]) -> "EvolutionCondition":
+        result = cls(int(obj.get("kind", 0)), int(obj.get("operator", 5)), int(obj.get("value", 0)))
+        result.validate()
+        return result
+
+
+@dataclass
+class core__EvolutionRoute:
+    enabled: bool = False
+    source_id: int = 0
+    conditions: list[core__EvolutionCondition] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, obj: dict[str, Any]) -> "EvolutionRoute":
+        route = cls(
+            bool(obj.get("enabled", False)),
+            int(obj.get("source_id", 0)),
+            [core__EvolutionCondition.from_dict(x) for x in obj.get("conditions", [])],
+        )
+        return route
+
+
+@dataclass
+class core__DigimonSlot:
+    digimon_id: int
+    name: str
+    stats: list[int]
+    frames: list[core__FrameRef]
+    evolution: core__EvolutionRoute = field(default_factory=core__EvolutionRoute)
+
+    @classmethod
+    def from_dict(cls, obj: dict[str, Any]) -> "DigimonSlot":
+        slot = cls(
+            digimon_id=int(obj["id"]),
+            name=str(obj.get("name", "")),
+            stats=[int(x) for x in obj.get("stats", [])],
+            frames=[core__FrameRef.from_dict(x) for x in obj.get("frames", [])],
+            evolution=core__EvolutionRoute.from_dict(obj.get("evolution", {})),
+        )
+        return slot
+
+
+@dataclass
+class core__Project:
+    slots: list[core__DigimonSlot]
+    rom_files: dict[str, str] = field(default_factory=dict)
+    project_path: Optional[Path] = None
+
+    def to_dict(self, path_for_files: Optional[Path] = None) -> dict[str, Any]:
+        return {
+            "format": core__PROJECT_FORMAT,
+            "app_version": core__APP_VERSION,
+            "rom_files": {"vanilla": self.rom_files.get("vanilla", "PenC1.bin")},
+            "slots": [
+                {
+                    "id": slot.digimon_id,
+                    "name": slot.name,
+                    "stats": slot.stats,
+                    "frames": [asdict(x) for x in slot.frames],
+                    "evolution": {
+                        "enabled": slot.evolution.enabled,
+                        "source_id": slot.evolution.source_id,
+                        "conditions": [asdict(x) for x in slot.evolution.conditions],
+                    },
+                }
+                for slot in self.slots
+            ],
+        }
+
+
+def core__sha256(data: bytes | bytearray) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def core__far_goto_words(byte_address: int) -> tuple[int, int]:
+    if byte_address & 1:
+        raise ValueError(f"far goto 대상 주소는 짝수여야 합니다: {byte_address:#x}")
+    word_address = byte_address // 2
+    return (65184 | word_address >> 16 & 1, word_address & 65535)
+
+
+def core__read_stat_words(data: bytes, slot_id: int, table: int) -> list[int]:
+    return list(struct.unpack_from("<18H", data, table + slot_id * core__STAT_RECORD_SIZE))
+
+
+def core__read_u16(data: bytes | bytearray, off: int) -> int:
+    return struct.unpack_from("<H", data, off)[0]
+
+
+def core__read_u32(data: bytes | bytearray, off: int) -> int:
+    return struct.unpack_from("<I", data, off)[0]
+
+
+def core__validate_display_name(name: str) -> str:
+    name = name.strip()
+    if not name:
+        raise ValueError("편집기 표시명이 비어 있습니다")
+    if len(name) > core__MAX_DISPLAY_NAME_LENGTH:
+        raise ValueError(f"편집기 표시명은 최대 {core__MAX_DISPLAY_NAME_LENGTH}자입니다: {name!r}")
+    return name
+
+
+def core__write_far_goto(data: bytearray, off: int, target: int) -> None:
+    a, b = core__far_goto_words(target)
+    core__write_u16(data, off, a)
+    core__write_u16(data, off + 2, b)
+
+
+def core__write_immediate6(data: bytearray, off: int, value: int) -> None:
+    if not 0 <= value <= 63:
+        raise ValueError(f"6비트 즉시값 범위 초과: {value}")
+    old = core__read_u16(data, off)
+    core__write_u16(data, off, old & 65472 | value)
+
+
+def core__write_u16(data: bytearray, off: int, value: int) -> None:
+    struct.pack_into("<H", data, off, value & 65535)
+
+
+def core__write_u32(data: bytearray, off: int, value: int) -> None:
+    struct.pack_into("<I", data, off, value & 4294967295)
+
+
+def core__write_stat_words(
+    data: bytearray, slot_id: int, words: list[int], table: int = core__FINAL_STAT_TABLE
+) -> None:
+    if len(words) != core__STAT_WORD_COUNT:
+        raise ValueError(f"스탯은 {core__STAT_WORD_COUNT}개 word여야 합니다")
+    for value in words:
+        if not 0 <= int(value) <= 65535:
+            raise ValueError(f"스탯 값 범위 초과: {value}")
+    struct.pack_into(
+        "<18H", data, table + slot_id * core__STAT_RECORD_SIZE, *[int(x) for x in words]
+    )
+
+
+def core__detect_image_count(data: bytes) -> int:
+    first_pointer = core__read_u32(data, core__BANK1)
+    if first_pointer % 4:
+        raise ValueError("이미지 포인터표 첫 값이 4의 배수가 아닙니다")
+    return first_pointer // 4
+
+
+def core___profile_structure_matches(
+    data: bytes, profile: RomProfileInfo, sample_count: int = 32
+) -> bool:
+
+    try:
+        if len(data) != core__ROM_SIZE or core__detect_image_count(data) != profile.image_count:
+            return False
+        count = min(sample_count, profile.image_count - 1)
+        minimum_start = core__BANK1 + profile.image_count * 4
+        previous_end = minimum_start
+        for i in range(count):
+            rel = core__read_u32(data, core__BANK1 + i * 4)
+            next_rel = core__read_u32(data, core__BANK1 + (i + 1) * 4)
+            width = core__read_u16(data, profile.size_table + i * 4)
+            height = core__read_u16(data, profile.size_table + i * 4 + 2)
+            if not (1 <= width <= 256 and 1 <= height <= 256):
+                return False
+            if width * height * 2 != next_rel - rel:
+                return False
+            start = core__BANK1 + rel
+            end = start + width * height * 2
+            if start < previous_end or end > core__SAVE_TAIL:
+                return False
+            previous_end = end
+        starts = [
+            # Native table location; the GUI's current table may be relocated.
+            core__read_stat_words(data, i, 0x02013E)[0]
+            for i in range(profile.roster_count)
+        ]
+        if starts != list(range(240, 240 + profile.roster_count * 12, 12)):
+            return False
+        return True
+    except (IndexError, struct.error, ValueError):
+        return False
+
+
+def core__build_evolution_code(slots: list[DigimonSlot]) -> tuple[bytes, dict[str, Any]]:
+    words: list[int] = []
+    route_reports: list[dict[str, Any]] = []
+    for slot in slots:
+        route = slot.evolution
+        if not route.enabled:
+            continue
+        route_start = len(words)
+        branch_placeholders: list[tuple[int, int]] = []
+        words.append(38912)
+        words.append(18496 + route.source_id)
+        branch_placeholders.append((len(words), 78))
+        words.append(0)
+        real_conditions = [c for c in route.conditions if c.kind != 0]
+        for condition in real_conditions:
+            condition.validate()
+            words.extend(
+                [
+                    65024,
+                    39180,
+                    core__CONDITION_STAT_ADDRESS[condition.kind],
+                    39140,
+                    18496 + condition.value,
+                ]
+            )
+            branch_placeholders.append(
+                (len(words), core__OPERATOR_INVERSE_BRANCH_HIGH[condition.operator])
+            )
+            words.append(0)
+        words.extend([38976 + slot.digimon_id, 55296])
+        words.extend(core__far_goto_words(core__EVO_RESULT_RETURN))
+        route_end = len(words)
+        for placeholder_index, high_byte in branch_placeholders:
+            distance = route_end - (placeholder_index + 1)
+            if not 0 <= distance <= 255:
+                raise ValueError(
+                    f"ID {slot.digimon_id:02d} 진화 경로 분기가 너무 깁니다: {distance} words"
+                )
+            words[placeholder_index] = high_byte << 8 | distance
+        route_reports.append(
+            {
+                "result_id": slot.digimon_id,
+                "source_id": route.source_id,
+                "conditions": len(real_conditions),
+                "word_start": route_start,
+                "word_end": route_end,
+            }
+        )
+    words.extend([65024, 39180, 2086])
+    words.extend(core__far_goto_words(core__EVO_HOOK_RETURN))
+    code = struct.pack("<" + "H" * len(words), *words)
+    capacity = core__EVO_CAVE_END - core__EVO_CAVE
+    if len(code) > capacity:
+        raise ValueError(
+            f"진화 코드 공간 초과: {len(code)} / {capacity} bytes. 조건 수를 줄이거나 일부 사용자 진화 경로를 비활성화하십시오."
+        )
+    return (
+        code,
+        {
+            "enabled_routes": len(route_reports),
+            "routes": route_reports,
+            "bytes_used": len(code),
+            "bytes_capacity": capacity,
+            "bytes_free": capacity - len(code),
+        },
+    )
+
+
+def rominput__generated_profile(data: bytes):
+    """Recognize editor output independently of its exported hardware target.
+
+    A profile number alone is insufficient: require the expanded table layout
+    and both copies of the compact renderer. These signatures survive Wave 3
+    and Godzilla export, unlike the native RAM instruction fingerprints.
+    """
+    if len(data) != 0x800000:
+        return None
+    try:
+        meta = engine__read_meta(data) or {}
+        version = int(meta.get("profile_version", -1))
+        if version not in range(6):
+            return None
+        profile = engine__PROFILES[version]
+        count = int(meta.get("roster_count", -1))
+        if not int(profile.stock_roster_count) <= count <= 516:
+            return None
+        table = album_layers__table_layout(profile, count)
+        if (
+            int(meta.get("stat_table", -1)) != int(table["stat"])
+            or int(meta.get("size_table", -1)) != int(table["size"])
+            or int(meta.get("image_count", -1)) != compact8__image_count(profile, count)
+            or core__detect_image_count(data) != int(meta["image_count"])
+            or not spriteio__has_compact_renderer(data, meta)
+        ):
+            return None
+        return core__ROM_PROFILE_BY_VERSION[version]
+    except (KeyError, TypeError, ValueError, IndexError, struct.error):
+        return None
+
+
+def rominput__detect_profile(data: bytes) -> core__RomProfileInfo:
+    """Allow editor output and native Wave 1/2, independently of save data.
+
+    The existing hardware-conversion contract covers 178 instruction contexts
+    per version. Both the embedded native code and supported expanded builds
+    retain these bytes; Wave 3 and Godzilla relocate their RAM operands.
+    All sampled bytes are below 0x06060E, outside the acquisition bitmap and
+    the entire 0x7FD000..0x800000 save/checksum tail. Metadata is not proof of
+    hardware identity: exported hardware variants retain the base profile.
+    Verified editor output is accepted before applying this native-only gate.
+    """
+    if len(data) != 0x800000:
+        raise ValueError(
+            f"ROM 파일은 정확히 8 MiB(8,388,608바이트)여야 합니다. 현재 크기: {len(data):,}바이트.\n"
+            "순정 PenC0·1·2·3·4·5와 정상적인 에디터 생성 ROM을 지원합니다."
+        )
+    generated = rominput__generated_profile(data)
+    if generated is not None:
+        return generated
+    matches = []
+    for version in range(6):
+        refs = penc67__OPERANDS[version]
+        context = b"".join(data[pos - 4 : pos + 10] for pos, _ in refs)
+        if hashlib.sha256(context).hexdigest() == penc67__CONTEXT_SHA256[version]:
+            matches.append(core__ROM_PROFILE_BY_VERSION[version])
+    if len(matches) != 1:
+        try:
+            meta = engine__read_meta(data)
+        except (KeyError, TypeError, ValueError, IndexError, struct.error):
+            meta = None
+        if meta:
+            raise ValueError(
+                "에디터 생성 정보는 있지만 ROM의 데이터 표·이미지 개수·렌더러 구성이 일치하지 않습니다.\n"
+                "파일이 손상되었거나 현재 읽을 수 없는 생성 형식일 수 있습니다. "
+                "정상 저장본 또는 해당 ROM을 만든 프로젝트를 사용해 주세요.\n"
+                "기기 종류·파일명·세이브 상태 때문에 차단한 것은 아닙니다."
+            )
+        raise ValueError(
+            "지원되는 PenC0·1·2·3·4·5의 실행 코드를 확인하지 못했습니다.\n"
+            "순정 PenC6·7(Wave 3) 및 Godzilla ROM은 열 수 없습니다.\n"
+            "에디터 생성 정보와 데이터 구조가 정상인 모딩 ROM은 기기 종류와 관계없이 열 수 있습니다.\n"
+            "파일명과 세이브 데이터는 판별 기준에 포함하지 않습니다."
+        )
+    return matches[0]
+
+
+def rominput__check_profile_version(version, profile) -> None:
+    if int(version) != int(profile.version):
+        raise ValueError(
+            "ROM 내부 실행 코드와 저장된 버전 정보가 일치하지 않습니다.\n"
+            "해당 ROM의 원래 프로젝트와 PenC0·1·2·3·4·5 기반 ROM을 사용해 주세요."
+        )
+
+
+def rominput__verify_generated_output(data):
+    """Reopen the actual export through the editor before reporting success."""
+    import tempfile
+
+    if rominput__generated_profile(data) is None:
+        raise ValueError("생성된 ROM의 모딩 데이터 구조를 확인하지 못했습니다.")
+    with tempfile.TemporaryDirectory(prefix="penc_reopen_") as folder:
+        path = Path(folder) / "output.bin"
+        path.write_bytes(data)
+        project, opened, images, layout = compact8__create_project_from_rom(path)
+        restored = modrom__restore_project_from_rom(project, opened, images, layout)
+        if not restored.get("modified_rom") or opened != data:
+            raise ValueError("생성된 ROM을 에디터에서 다시 읽는 검사를 통과하지 못했습니다.")
+        if int(restored.get("stats_restored", 0)) != int(layout.roster_count):
+            raise ValueError("생성된 ROM의 디지몬 데이터를 모두 복원하지 못했습니다.")
+        return {
+            "valid": True,
+            "reopened_from_file": True,
+            "profile_version": int(layout.profile.version),
+            "roster_count": int(layout.roster_count),
+            "image_count": len(images),
+            "input_save_validated": False,
+        }
+
+
+def core__detect_penc_profile(data: bytes) -> core__RomProfileInfo:
+    profile = rominput__detect_profile(data)
+    if core___profile_structure_matches(data, profile):
+        return profile
+    raise ValueError(f"PenC{profile.version}의 원본 이미지·스탯 구조를 확인하지 못했습니다.")
+
+
+def core__load_project(path: Path) -> core__Project:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    project_format = obj.get("format")
+    if (
+        project_format != core__PROJECT_FORMAT
+        and project_format not in core__LEGACY_PROJECT_FORMATS
+    ):
+        raise ValueError(f"지원하지 않는 프로젝트 형식: {project_format!r}")
+    slots = [core__DigimonSlot.from_dict(x) for x in obj.get("slots", [])]
+    for slot in slots:
+        if (
+            len(slot.stats) == core__STAT_WORD_COUNT
+            and slot.digimon_id >= core__ORIGINAL_ROSTER_COUNT
+        ):
+            slot.stats[core__ALBUM_ORDER_STAT_INDEX] = slot.digimon_id
+    slots.sort(key=lambda x: x.digimon_id)
+    project = core__Project(
+        slots=slots, rom_files=dict(obj.get("rom_files", {})), project_path=path.resolve()
+    )
+    for slot in project.slots:
+        for frame in slot.frames:
+            if frame.kind == "file":
+                p = Path(str(frame.value))
+                if not p.is_absolute():
+                    frame.value = str((path.parent / p).resolve())
+    core__validate_project(project)
+    return project
+
+
+def core__patch_album_cursor(output: bytearray) -> None:
+    output[core__ALBUM_CAVE : core__ALBUM_CAVE + 64] = b"\x00" * 64
+    words = [2113, 18496 + core__ROSTER_COUNT, 19969, 38976, 0, 0]
+    words[4], words[5] = core__far_goto_words(core__ALBUM_RETURN)
+    struct.pack_into("<6H", output, core__ALBUM_CAVE, *words)
+    core__write_far_goto(output, core__ALBUM_HOOK, core__ALBUM_CAVE)
+
+
+def core__patch_evolution(output: bytearray, slots: list[DigimonSlot]) -> dict[str, Any]:
+    code, report = core__build_evolution_code(slots)
+    output[core__EVO_CAVE:core__EVO_CAVE_END] = b"\x00" * (core__EVO_CAVE_END - core__EVO_CAVE)
+    output[core__EVO_CAVE : core__EVO_CAVE + len(code)] = code
+    core__write_far_goto(output, core__EVO_HOOK, core__EVO_CAVE)
+    return report
+
+
+def core__pil_to_rgb565(pil_image: Image.Image) -> core__RomImage:
+    rgba = pil_image.convert("RGBA")
+    if rgba.size != (48, 48):
+        raise ValueError(f"스프라이트 PNG는 48x48이어야 합니다: {rgba.size[0]}x{rgba.size[1]}")
+    out = bytearray(48 * 48 * 2)
+    pos = 0
+    raw_rgba = rgba.tobytes()
+    for pixel_offset in range(0, len(raw_rgba), 4):
+        r, g, b, a = raw_rgba[pixel_offset : pixel_offset + 4]
+        if a == 0:
+            word = 2016
+        else:
+            hist_o = (r * 31 + 127) // 255
+            g6 = (g * 63 + 127) // 255
+            b5 = (b * 31 + 127) // 255
+            if hist_o == 0 and g6 == 63 and (b5 == 0):
+                g6 = 62
+            word = hist_o << 11 | g6 << 5 | b5
+        struct.pack_into("<H", out, pos, word)
+        pos += 2
+    return core__RomImage(48, 48, bytes(out))
+
+
+def core__read_images(data: bytes, count: int, size_table: int) -> list[core__RomImage]:
+    declared = core__detect_image_count(data)
+    if declared != count:
+        raise ValueError(f"이미지 수 불일치: 기대 {count}, ROM {declared}")
+    images: list[core__RomImage] = []
+    minimum_start = core__BANK1 + count * 4
+    previous_end = minimum_start
+    for i in range(count):
+        rel = core__read_u32(data, core__BANK1 + i * 4)
+        width = core__read_u16(data, size_table + i * 4)
+        height = core__read_u16(data, size_table + i * 4 + 2)
+        if not (1 <= width <= 256 and 1 <= height <= 256):
+            raise ValueError(f"이미지 {i}: 잘못된 크기 {width}x{height}")
+        start = core__BANK1 + rel
+        end = start + width * height * 2
+        if start < minimum_start or end > core__SAVE_TAIL:
+            raise ValueError(f"이미지 {i}: 범위 오류 {start:#x}..{end:#x}")
+        if start < previous_end:
+            raise ValueError(f"이미지 {i}: 데이터가 순서대로 배치되지 않았습니다")
+        images.append(core__RomImage(width, height, data[start:end]))
+        previous_end = end
+    return images
+
+
+def core__read_original_jogress_rows(vanilla: bytes) -> list[list[int]]:
+
+    pointer_table = core__read_u16(vanilla, core__JOGRESS_POINTER_LOAD_SITE) * 2
+    rows: list[list[int]] = []
+    for source_id in range(core__ORIGINAL_ROSTER_COUNT):
+        pointer = core__read_u32(vanilla, pointer_table + source_id * 4)
+        if pointer < 2097152:
+            raise ValueError(f"원본 조그레스 포인터 오류: ID {source_id:02d} = {pointer:#x}")
+        row_off = (pointer - 2097152) * 2
+        if row_off < 0 or row_off + 8 > len(vanilla):
+            raise ValueError(f"원본 조그레스 행 범위 오류: ID {source_id:02d}")
+        rows.append([core__read_u16(vanilla, row_off + i * 2) for i in range(4)])
+    return rows
+
+
+def core__resolve_frame(ref: FrameRef, base_images: list[RomImage]) -> core__RomImage:
+    if ref.kind == "base":
+        idx = int(ref.value)
+        if not 0 <= idx < len(base_images):
+            raise ValueError(f"기반 ROM 이미지 번호 범위 오류: {idx} (0~{len(base_images)-1})")
+        image = base_images[idx]
+    elif ref.kind == "file":
+        path = Path(str(ref.value))
+        if not path.exists():
+            raise FileNotFoundError(f"PNG 파일 없음: {path}")
+        with Image.open(path) as pil:
+            image = core__pil_to_rgb565(pil)
+    elif ref.kind == "embedded":
+        try:
+            pixels = base64.b64decode(str(ref.value), validate=True)
+        except Exception as exc:
+            raise ValueError("내장 스프라이트 base64 데이터가 손상되었습니다") from exc
+        expected = 48 * 48 * 2
+        if len(pixels) != expected:
+            raise ValueError(f"내장 스프라이트 크기 오류: {len(pixels)} bytes (기대 {expected})")
+        image = core__RomImage(48, 48, pixels)
+    else:
+        raise ValueError(f"지원하지 않는 frame kind: {ref.kind}")
+    if (image.width, image.height) != (48, 48):
+        raise ValueError(f"스프라이트는 48x48이어야 합니다: {image.width}x{image.height}")
+    return image
+
+
+def core__resolve_rom_paths(project: Project, rom_dir: Optional[Path] = None) -> dict[str, Path]:
+    search_dirs: list[Path] = []
+    if rom_dir:
+        search_dirs.append(rom_dir.resolve())
+    if project.project_path:
+        search_dirs.append(project.project_path.parent.resolve())
+    search_dirs.extend([Path.cwd().resolve(), Path(__file__).resolve().parent])
+    configured = project.rom_files.get("vanilla", "PenC1.bin")
+    p = Path(configured)
+    candidates: list[Path] = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.extend((d / p for d in search_dirs))
+        candidates.extend((d / "PenC1.bin" for d in search_dirs))
+    found = next((x for x in candidates if x.exists()), None)
+    if found is None:
+        raise FileNotFoundError("PenC1.bin을 찾을 수 없습니다")
+    return {"vanilla": found.resolve()}
+
+
+def core__rgb565_to_pil(image: RomImage) -> Image.Image:
+    rgba = bytearray(image.width * image.height * 4)
+    out_i = 0
+    for (word,) in struct.iter_unpack("<H", image.pixels):
+        if word == 2016:
+            r = g = b = 0
+            a = 0
+        else:
+            hist_o = word >> 11 & 31
+            g6 = word >> 5 & 63
+            b5 = word & 31
+            r = (hist_o * 255 + 15) // 31
+            g = (g6 * 255 + 31) // 63
+            b = (b5 * 255 + 15) // 31
+            a = 255
+        rgba[out_i : out_i + 4] = bytes((r, g, b, a))
+        out_i += 4
+    return Image.frombytes("RGBA", (image.width, image.height), bytes(rgba))
+
+
+def core__validate_project(project: Project) -> None:
+    if len(project.slots) != core__ROSTER_COUNT:
+        raise ValueError(f"프로젝트 슬롯은 정확히 {core__ROSTER_COUNT}개여야 합니다")
+    seen: set[int] = set()
+    for expected_id, slot in enumerate(project.slots):
+        if slot.digimon_id != expected_id:
+            raise ValueError(
+                f"슬롯 ID는 000부터 순서대로 이어져야 합니다: 위치 {expected_id:03d}에 ID {slot.digimon_id:03d}"
+            )
+        if slot.digimon_id in seen:
+            raise ValueError(f"중복 ID: {slot.digimon_id}")
+        seen.add(slot.digimon_id)
+        if not 0 <= slot.digimon_id <= core__MAX_ID:
+            raise ValueError(f"ID 범위 오류: {slot.digimon_id}")
+        core__validate_display_name(slot.name)
+        if len(slot.stats) != core__STAT_WORD_COUNT:
+            raise ValueError(
+                f"ID {slot.digimon_id:02d}: 스탯 word 수가 {core__STAT_WORD_COUNT}개가 아닙니다"
+            )
+        for stat_index, stat_value in enumerate(slot.stats):
+            if stat_index in (0, 13):
+                continue
+            minimum = core__STAT_MINIMUMS[stat_index]
+            maximum = core__STAT_MAXIMUMS[stat_index]
+            if not minimum <= int(stat_value) <= maximum:
+                raise ValueError(
+                    f"ID {slot.digimon_id:02d}: {core__STAT_LABELS[stat_index]} 값은 {minimum}~{maximum} 범위여야 합니다: {stat_value}"
+                )
+        if len(slot.frames) != core__FRAMES_PER_DIGIMON:
+            raise ValueError(f"ID {slot.digimon_id:02d}: 스프라이트가 12장이 아닙니다")
+        if slot.evolution.enabled:
+            if not 0 <= slot.evolution.source_id <= core__MAX_ID:
+                raise ValueError(f"ID {slot.digimon_id:02d}: 진화 전 ID 범위 오류")            always_count = sum((c.kind == 0 for c in slot.evolution.conditions))
+            if always_count and len(slot.evolution.conditions) != 1:
+                raise ValueError(
+                    f"ID {slot.digimon_id:02d}: '항상'은 다른 조건과 함께 쓸 수 없습니다"
+                )
+            for condition in slot.evolution.conditions:
+                condition.validate()
+    if seen != set(range(core__ROSTER_COUNT)):
+        missing = sorted(set(range(core__ROSTER_COUNT)) - seen)
+        raise ValueError(f"누락된 ID: {missing}")
+
+
+def core__parse_editor_integer(value: str) -> int:
+    """Read decimal UI values, including leading zeroes, and explicit base prefixes."""
+    text = str(value).strip()
+    prefix = text.lstrip("+-").lower()
+    return int(text, 0 if prefix.startswith(("0x", "0o", "0b")) else 10)
+
+
+class core__EditorGUI:
+
+    def __init__(self, root: Any, initial_project: Optional[Path] = None) -> None:
+        import tkinter as tk
+        from tkinter import ttk
+
+        self.tk = tk
+        self.ttk = ttk
+        self.root = root
+        self.root.title(f"PenC1 45마리 편집기 / PenC0–PenC5 ROM 인식 v{core__APP_VERSION}")
+        self.root.geometry("1240x820")
+        self.root.minsize(1060, 700)
+        self.project: Optional[core__Project] = None
+        self.rom_paths: dict[str, Path] = {}
+        self.vanilla: Optional[bytes] = None
+        self.base_images: list[core__RomImage] = []
+        self.current_id = 0
+        self.preview_cache: list[Any] = []
+        self.stat_vars: list[Any] = []
+        self.condition_selected_index: Optional[int] = None
+        self.dirty = False
+        self._loading_slot = False
+        self._build_menu()
+        self._build_layout()
+        try:
+            if initial_project:
+                self.open_project(initial_project)
+            else:
+                self.new_project(auto=True)
+        except Exception as exc:
+            self.show_error("초기화 실패", exc)
+
+    def _auto_rom_dir(self) -> Path:
+        return Path(__file__).resolve().parent
+
+    def _build_basic_tab(self) -> None:
+        tk, ttk = (self.tk, self.ttk)
+        top = ttk.LabelFrame(polish__tab_content(self, self.basic_tab), text="슬롯 정보")
+        top.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(top, text="ID").grid(row=0, column=0, padx=6, pady=6, sticky="e")
+        self.id_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.id_var, width=8, state="readonly").grid(
+            row=0, column=1, padx=6, pady=6, sticky="w"
+        )
+        ttk.Label(
+            top,
+            text=f"편집기 표시명 (게임에는 출력되지 않음, 최대 {core__MAX_DISPLAY_NAME_LENGTH}자)",
+        ).grid(row=0, column=2, padx=6, pady=6, sticky="e")
+        self.name_var = tk.StringVar()
+        name_entry = ttk.Entry(top, textvariable=self.name_var, width=32)
+        name_entry.grid(row=0, column=3, padx=6, pady=6, sticky="w")
+        name_entry.bind("<FocusOut>", lambda _e: self.commit_current_slot())
+        name_entry.bind("<Return>", lambda _e: self.commit_current_slot())
+        clone_frame = ttk.Frame(top)
+        clone_frame.grid(row=1, column=0, columnspan=4, sticky="w", padx=6, pady=6)
+        ttk.Label(clone_frame, text="다른 슬롯의 표시명·스탯을 복사:").pack(side=tk.LEFT)
+        self.clone_slot_var = tk.StringVar()
+        self.clone_slot_combo = ttk.Combobox(
+            clone_frame, textvariable=self.clone_slot_var, state="readonly", width=30
+        )
+        self.clone_slot_combo.pack(side=tk.LEFT, padx=6)
+        ttk.Button(clone_frame, text="복사", command=self.clone_basic_from_slot).pack(side=tk.LEFT)
+        stats_box = ttk.LabelFrame(
+            polish__tab_content(self, self.basic_tab),
+            text="스탯 레코드 (기존 에디터 VP1 정의, 16-bit word 18개)",
+        )
+        stats_box.pack(fill=tk.X, padx=10, pady=(0, 10))
+        info = "00 스프라이트 시작 번호와 13 도감 순서는 ROM 생성 시 자동 계산됩니다. 표시명은 편집기 식별용이며 PenC 화면에는 출력되지 않습니다."
+        ttk.Label(stats_box, text=info, wraplength=830).pack(anchor="w", padx=8, pady=6)
+        grid = ttk.Frame(stats_box)
+        grid.pack(anchor="nw", padx=8, pady=6)
+        self.stat_vars = []
+        self.stat_entries: list[Any] = []
+        for i, label in enumerate(core__STAT_LABELS):
+            row = i % 9
+            col_group = i // 9
+            base_col = col_group * 3
+            range_text = (
+                "자동" if i in (0, 13) else f"{core__STAT_MINIMUMS[i]}~{core__STAT_MAXIMUMS[i]}"
+            )
+            ttk.Label(grid, text=f"{i:02d} {label} [{range_text}]").grid(
+                row=row, column=base_col, padx=(4, 6), pady=4, sticky="e"
+            )
+            var = tk.StringVar()
+            self.stat_vars.append(var)
+            entry = ttk.Entry(grid, textvariable=var, width=10)
+            self.stat_entries.append(entry)
+            entry.grid(row=row, column=base_col + 1, padx=(0, 18), pady=4, sticky="w")
+            if i in (0, core__ALBUM_ORDER_STAT_INDEX):
+                entry.configure(state="readonly")
+            else:
+                entry.bind("<FocusOut>", lambda _e: self.commit_current_slot())
+                entry.bind("<Return>", lambda _e: self.commit_current_slot())
+
+    def _build_evolution_tab(self) -> None:
+        tk, ttk = (self.tk, self.ttk)
+        top = ttk.LabelFrame(self.evolution_tab, text="사용자 진화 경로")
+        top.pack(fill=tk.X, padx=10, pady=10)
+        self.evo_enabled_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            top,
+            text="이 디지몬으로 진화하는 사용자 경로 사용",
+            variable=self.evo_enabled_var,
+            command=self.commit_current_slot,
+        ).grid(row=0, column=0, columnspan=3, padx=6, pady=6, sticky="w")
+        ttk.Label(top, text="진화 전 디지몬").grid(row=1, column=0, padx=6, pady=6, sticky="e")
+        self.evo_source_var = tk.StringVar()
+        self.evo_source_combo = ttk.Combobox(
+            top, textvariable=self.evo_source_var, state="readonly", width=35
+        )
+        self.evo_source_combo.grid(row=1, column=1, padx=6, pady=6, sticky="w")
+        self.evo_source_combo.bind("<<ComboboxSelected>>", lambda _e: self.commit_current_slot())
+        self.evo_result_var = tk.StringVar()
+        ttk.Label(top, textvariable=self.evo_result_var).grid(
+            row=1, column=2, padx=12, pady=6, sticky="w"
+        )
+        cond_box = ttk.LabelFrame(self.evolution_tab, text="조건 (모든 행을 동시에 만족해야 진화)")
+        cond_box.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.condition_tree = ttk.Treeview(
+            cond_box, columns=("num", "kind", "op", "value"), show="headings", height=14
+        )
+        for col, title, width in [
+            ("num", "#", 45),
+            ("kind", "조건", 240),
+            ("op", "비교", 80),
+            ("value", "값", 100),
+        ]:
+            self.condition_tree.heading(col, text=title)
+            self.condition_tree.column(col, width=width, anchor="center" if col != "kind" else "w")
+        self.condition_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        self.condition_tree.bind("<Double-1>", lambda _e: self.edit_condition())
+        buttons = ttk.Frame(cond_box)
+        buttons.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Button(buttons, text="조건 추가", command=self.add_condition).pack(side=tk.LEFT, padx=3)
+        ttk.Button(buttons, text="조건 수정", command=self.edit_condition).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(buttons, text="조건 삭제", command=self.delete_condition).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(buttons, text="위로", command=lambda: self.move_condition(-1)).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(buttons, text="아래로", command=lambda: self.move_condition(1)).pack(
+            side=tk.LEFT, padx=3
+        )
+        ttk.Button(buttons, text="항상 진화", command=self.set_always_condition).pack(
+            side=tk.LEFT, padx=12
+        )
+        ttk.Label(
+            cond_box,
+            text="비교는 왼쪽의 실제 게임 값 기준입니다. 예: 총 배틀 >= 10은 실제 총 배틀 수가 10 이상일 때 통과. 여러 조건은 모두 참이어야 합니다. 조건이 없거나 '항상'이면 진화 전 ID만 검사합니다.",
+            wraplength=850,
+        ).pack(anchor="w", padx=10, pady=(0, 8))
+
+    def _build_layout(self) -> None:
+        tk, ttk = (self.tk, self.ttk)
+        outer = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        outer.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        left = ttk.Frame(outer, width=280)
+        right = ttk.Frame(outer)
+        outer.add(left, weight=0)
+        outer.add(right, weight=1)
+        ttk.Label(left, text="로스터 ID 00–44", font=("TkDefaultFont", 11, "bold")).pack(
+            anchor="w", pady=(0, 6)
+        )
+        self.roster_tree = ttk.Treeview(
+            left, columns=("id", "name", "type"), show="headings", height=30
+        )
+        self.roster_tree.heading("id", text="ID")
+        self.roster_tree.heading("name", text="편집기 표시명")
+        self.roster_tree.heading("type", text="구분")
+        self.roster_tree.column("id", width=45, anchor="center", stretch=False)
+        self.roster_tree.column("name", width=145, anchor="w")
+        self.roster_tree.column("type", width=55, anchor="center", stretch=False)
+        scroll = ttk.Scrollbar(left, orient="vertical", command=self.roster_tree.yview)
+        self.roster_tree.configure(yscrollcommand=scroll.set)
+        self.roster_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.roster_tree.bind("<<TreeviewSelect>>", self.on_roster_select)
+        self.notebook = ttk.Notebook(right)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        self.basic_tab = ttk.Frame(self.notebook)
+        self.sprite_tab = ttk.Frame(self.notebook)
+        self.evolution_tab = ttk.Frame(self.notebook)
+        self.notebook.add(self.basic_tab, text="기본/스탯")
+        self.notebook.add(self.sprite_tab, text="스프라이트 00–11")
+        self.notebook.add(self.evolution_tab, text="진화 조건")
+        self._build_basic_tab()
+        self._build_sprite_tab()
+        self._build_evolution_tab()
+        status_frame = ttk.Frame(self.root)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=(0, 8), before=outer)
+        self.status_var = tk.StringVar(value="준비")
+        ttk.Label(status_frame, textvariable=self.status_var).pack(side=tk.LEFT)
+        self.capacity_var = tk.StringVar(value="")
+        ttk.Label(status_frame, textvariable=self.capacity_var).pack(side=tk.RIGHT)
+
+
+    def _build_sprite_tab(self) -> None:
+        tk, ttk = (self.tk, self.ttk)
+        toolbar = ttk.Frame(polish__tab_content(self, self.sprite_tab))
+        toolbar.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Button(
+            toolbar, text="폴더에서 00–11 일괄 가져오기", command=self.import_sprite_folder
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar, text="다른 슬롯 12장 복사", command=self.copy_sprite_from_slot).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(toolbar, text="12장 내보내기", command=self.export_sprite_folder).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(toolbar, text="이 슬롯 기본값 복원", command=self.reset_slot_frames).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Label(
+            polish__tab_content(self, self.sprite_tab),
+            text="프레임은 항상 번호 00→11 순서로 표시·기록됩니다. 각 그림을 클릭하면 해당 번호만 교체합니다.",
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+        grid = ttk.Frame(polish__tab_content(self, self.sprite_tab))
+        grid.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        self.sprite_buttons: list[Any] = []
+        self.sprite_image_labels: list[Any] = []
+        self.sprite_source_vars: list[Any] = []
+        for i in range(core__FRAMES_PER_DIGIMON):
+            row, col = divmod(i, 4)
+            cell = ttk.LabelFrame(grid, text=f"프레임 {i:02d}")
+            cell.grid(row=row, column=col, padx=8, pady=8, sticky="nsew")
+            grid.columnconfigure(col, weight=1)
+            grid.rowconfigure(row, weight=1)
+            label = ttk.Label(cell, text="", anchor="center")
+            label.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+            label.bind("<Button-1>", lambda _e, idx=i: self.replace_single_frame(idx))
+            source_var = tk.StringVar()
+            ttk.Label(cell, textvariable=source_var, justify="center").pack(pady=(0, 4))
+            btn = ttk.Button(
+                cell, text=f"{i:02d} 교체", command=lambda idx=i: self.replace_single_frame(idx)
+            )
+            btn.pack(pady=(0, 6))
+            self.sprite_image_labels.append(label)
+            self.sprite_source_vars.append(source_var)
+            self.sprite_buttons.append(btn)
+
+    def _find_auto_penc1_path(self) -> Optional[Path]:
+        directories = [Path.cwd().resolve(), Path(__file__).resolve().parent]
+        preferred_names = ("PenC1.bin", "PenC1(1).bin", "penc1.bin", "Penc1.bin")
+        checked: set[Path] = set()
+        for directory in directories:
+            candidates = [directory / name for name in preferred_names]
+            try:
+                candidates.extend(sorted(directory.glob("*.bin")))
+            except OSError:
+                pass
+            for candidate in candidates:
+                try:
+                    candidate = candidate.resolve()
+                except OSError:
+                    continue
+                if candidate in checked or not candidate.is_file():
+                    continue
+                checked.add(candidate)
+                try:
+                    if core__detect_penc_profile(candidate.read_bytes()).version == 1:
+                        return candidate
+                except Exception:
+                    continue
+        return None
+
+    def _resolve_pil(self, ref: FrameRef) -> Image.Image:
+        image = core__resolve_frame(ref, self.base_images)
+        return core__rgb565_to_pil(image)
+
+    def clone_basic_from_slot(self) -> None:
+        if self.project is None:
+            return
+        text = self.clone_slot_var.get()
+        if not text:
+            return
+        source_id = int(text.split()[0])
+        source = self.project.slots[source_id]
+        target = self.project.slots[self.current_id]
+        target.name = source.name
+        target.stats = list(source.stats)
+        if target.digimon_id >= core__ORIGINAL_ROSTER_COUNT:
+            target.stats[core__ALBUM_ORDER_STAT_INDEX] = target.digimon_id
+        self.dirty = True
+        self.load_slot(self.current_id)
+        self.refresh_roster()
+        self.update_status(
+            f"ID {source_id:02d}의 표시명·스탯을 ID {self.current_id:02d}에 복사했습니다"
+        )
+
+    def commit_current_slot(self) -> None:
+        if self._loading_slot or self.project is None:
+            return
+        slot = self.project.slots[self.current_id]
+        name = self.name_var.get().strip()
+        name = core__validate_display_name(name)
+        stats = list(slot.stats)
+        for i, var in enumerate(self.stat_vars):
+            if i in (0, core__ALBUM_ORDER_STAT_INDEX):
+                continue
+            text = var.get().strip()
+            value = core__parse_editor_integer(text) if text else 0
+            minimum = core__STAT_MINIMUMS[i]
+            maximum = core__STAT_MAXIMUMS[i]
+            if not minimum <= value <= maximum:
+                raise ValueError(
+                    f"{core__STAT_LABELS[i]} 값 범위는 {minimum}~{maximum}입니다: {value}"
+                )
+            stats[i] = value
+        if slot.digimon_id >= core__ORIGINAL_ROSTER_COUNT:
+            stats[core__ALBUM_ORDER_STAT_INDEX] = slot.digimon_id
+        enabled = bool(self.evo_enabled_var.get())
+        source_text = self.evo_source_var.get().strip()
+        source_id = int(source_text.split()[0]) if source_text else slot.evolution.source_id
+        changed = (
+            name != slot.name or stats != slot.stats
+            or enabled != slot.evolution.enabled or source_id != slot.evolution.source_id
+        )
+        # Validate every input before updating the selected slot.
+        slot.name = name
+        slot.stats = stats
+        slot.evolution.enabled = enabled
+        slot.evolution.source_id = source_id
+        self.roster_tree.item(
+            str(slot.digimon_id),
+            values=(
+                f"{slot.digimon_id:02d}",
+                slot.name,
+                "기존" if slot.digimon_id < core__ORIGINAL_ROSTER_COUNT else "추가",
+            ),
+        )
+        self.evo_result_var.set(f"→ 결과: {slot.digimon_id:02d} {slot.name}")
+        self.dirty = self.dirty or changed
+        self.update_capacity()
+
+    def load_reference_roms(self, rom_dir: Optional[Path] = None) -> None:
+        if self.project is None:
+            raise RuntimeError("프로젝트가 없습니다")
+        paths = core__resolve_rom_paths(self.project, rom_dir or self._auto_rom_dir())
+        vanilla = paths["vanilla"].read_bytes()
+        profile = core__detect_penc_profile(vanilla)
+        if profile.version != 1:
+            raise ValueError(
+                f"이 프로젝트의 기반 ROM은 PenC1이어야 합니다. 선택된 파일: {profile.label}"
+            )
+        self.rom_paths = paths
+        self.vanilla = vanilla
+        self.base_images = core__read_images(vanilla, profile.image_count, profile.size_table)
+
+    def load_slot(self, slot_id: int) -> None:
+        if self.project is None:
+            return
+        self._loading_slot = True
+        try:
+            self.current_id = slot_id
+            slot = self.project.slots[slot_id]
+            self.id_var.set(f"{slot_id:02d}")
+            self.name_var.set(slot.name)
+            for i, var in enumerate(self.stat_vars):
+                value = slot.stats[i]
+                if i == 0:
+                    value = (
+                        core__read_stat_words(self.vanilla, slot_id, core__ORIGINAL_STAT_TABLE)[0]
+                        if slot_id < core__ORIGINAL_ROSTER_COUNT and self.vanilla
+                        else core__VANILLA_IMAGE_COUNT
+                        + (slot_id - core__ORIGINAL_ROSTER_COUNT) * core__FRAMES_PER_DIGIMON
+                    )
+                elif i == core__ALBUM_ORDER_STAT_INDEX:
+                    value = (
+                        core__read_stat_words(self.vanilla, slot_id, core__ORIGINAL_STAT_TABLE)[
+                            core__ALBUM_ORDER_STAT_INDEX
+                        ]
+                        if slot_id < core__ORIGINAL_ROSTER_COUNT and self.vanilla
+                        else slot_id
+                    )
+                var.set(str(value))
+                if i == core__ALBUM_VISIBLE_STAT_INDEX:
+                    self.stat_entries[i].configure(state="normal")
+            choices = list(self.evo_source_combo["values"])
+            source_index = min(max(slot.evolution.source_id, 0), core__MAX_ID)
+            self.evo_source_var.set(choices[source_index] if choices else f"{source_index:02d}")
+            self.evo_enabled_var.set(slot.evolution.enabled)
+            self.evo_result_var.set(f"→ 결과: {slot_id:02d} {slot.name}")
+            self.refresh_conditions()
+            self.refresh_sprite_previews()
+            self.clone_slot_var.set(choices[0] if choices else "")
+        finally:
+            self._loading_slot = False
+
+
+    def on_roster_select(self, _event: Any = None) -> None:
+        selection = self.roster_tree.selection()
+        if not selection:
+            return
+        new_id = int(selection[0])
+        if new_id == self.current_id and (not self._loading_slot):
+            return
+        try:
+            self.commit_current_slot()
+        except Exception as exc:
+            self.show_error("현재 슬롯 저장 실패", exc)
+            self.roster_tree.selection_set(str(self.current_id))
+            return
+        self.load_slot(new_id)
+
+
+    def open_source_rom_browser(self, source: LoadedSourceRom) -> None:
+
+        from tkinter import filedialog, messagebox
+        from PIL import ImageTk
+
+        tk, ttk = (self.tk, self.ttk)
+        window = tk.Toplevel(self.root)
+        window.title(f"{source.profile.label} 스프라이트 소스 - {source.path.name}")
+        window.geometry("900x650")
+        window.minsize(760, 560)
+        window.transient(self.root)
+        top = ttk.Frame(window)
+        top.pack(fill=tk.X, padx=10, pady=10)
+        ttk.Label(
+            top,
+            text=f"인식: {source.profile.label} | 로스터 {source.profile.roster_count}마리 | 이미지 {source.profile.image_count}장 | 크기표 0x{source.profile.size_table:06X}",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            top,
+            text="왼쪽에서 원본 ID를 고른 뒤 12장 스프라이트를 현재 PenC1 슬롯으로 복사할 수 있습니다.",
+        ).pack(anchor="w", pady=(4, 0))
+        body = ttk.Panedwindow(window, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        left = ttk.Frame(body, width=180)
+        right = ttk.Frame(body)
+        body.add(left, weight=0)
+        body.add(right, weight=1)
+        tree = ttk.Treeview(left, columns=("id", "start"), show="headings", height=25)
+        tree.heading("id", text="원본 ID")
+        tree.heading("start", text="이미지 시작")
+        tree.column("id", width=80, anchor="center")
+        tree.column("start", width=85, anchor="center")
+        scrollbar = ttk.Scrollbar(left, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        starts: list[int] = []
+        for source_id in range(source.profile.roster_count):
+            start = core__read_stat_words(source.data, source_id, core__ORIGINAL_STAT_TABLE)[0]
+            if start + core__FRAMES_PER_DIGIMON > len(source.images):
+                raise ValueError(
+                    f"{source.profile.label} ID {source_id:02d} 스프라이트 범위 오류: {start}"
+                )
+            starts.append(start)
+            tree.insert("", "end", iid=str(source_id), values=(f"{source_id:02d}", start))
+        preview_frame = ttk.Frame(right)
+        preview_frame.pack(fill=tk.BOTH, expand=True)
+        preview_labels: list[Any] = []
+        preview_cache: list[Any] = []
+        for frame_index in range(core__FRAMES_PER_DIGIMON):
+            box = ttk.LabelFrame(preview_frame, text=f"{frame_index:02d}")
+            box.grid(row=frame_index // 4, column=frame_index % 4, padx=5, pady=5, sticky="nsew")
+            label = ttk.Label(box, text="-")
+            label.pack(padx=5, pady=5)
+            preview_labels.append(label)
+        for col in range(4):
+            preview_frame.columnconfigure(col, weight=1)
+        for row in range(3):
+            preview_frame.rowconfigure(row, weight=1)
+        selected_id = {"value": 0}
+
+        def source_frames(source_id: int) -> list[core__RomImage]:
+            start = starts[source_id]
+            frames = source.images[start : start + core__FRAMES_PER_DIGIMON]
+            for frame_index, image in enumerate(frames):
+                if (image.width, image.height) != (48, 48):
+                    raise ValueError(
+                        f"{source.profile.label} ID {source_id:02d} frame {frame_index:02d}는 48x48이 아닙니다: {image.width}x{image.height}"
+                    )
+            return frames
+
+        def refresh_preview(_event: Any = None) -> None:
+            selection = tree.selection()
+            if not selection:
+                return
+            source_id = int(selection[0])
+            selected_id["value"] = source_id
+            frames = source_frames(source_id)
+            preview_cache.clear()
+            for frame_index, (label, image) in enumerate(zip(preview_labels, frames)):
+                pil = core__rgb565_to_pil(image).resize((96, 96), Image.Resampling.NEAREST)
+                photo = ImageTk.PhotoImage(pil)
+                preview_cache.append(photo)
+                label.configure(image=photo, text="")
+            window.title(f"{source.profile.label} ID {source_id:02d} - {source.path.name}")
+
+        def copy_to_current_slot() -> None:
+            if self.project is None:
+                messagebox.showwarning(
+                    "PenC1 프로젝트 필요",
+                    "먼저 PenC1 ROM을 열어 45마리 프로젝트를 만든 뒤 복사하십시오.",
+                    parent=window,
+                )
+                return
+            source_id = selected_id["value"]
+            frames = source_frames(source_id)
+            target = self.project.slots[self.current_id]
+            target.frames = [
+                core__FrameRef("embedded", base64.b64encode(image.pixels).decode("ascii"))
+                for image in frames
+            ]
+            self.dirty = True
+            self.refresh_sprite_previews()
+            self.update_status(
+                f"{source.profile.label} ID {source_id:02d} → PenC1 ID {self.current_id:02d} 스프라이트 복사"
+            )
+            messagebox.showinfo(
+                "복사 완료",
+                f"{source.profile.label} ID {source_id:02d}의 12장을 현재 PenC1 슬롯 ID {self.current_id:02d}에 복사했습니다.\n스프라이트는 프로젝트 JSON에 내장되므로 원본 소스 ROM이 없어도 다시 열 수 있습니다.",
+                parent=window,
+            )
+
+        def export_pngs() -> None:
+            source_id = selected_id["value"]
+            directory = filedialog.askdirectory(
+                title=f"{source.profile.label} ID {source_id:02d} PNG 저장 폴더", parent=window
+            )
+            if not directory:
+                return
+            out_dir = Path(directory)
+            for frame_index, image in enumerate(source_frames(source_id)):
+                core__rgb565_to_pil(image).save(out_dir / f"{frame_index:02d}.png")
+            self.update_status(f"{source.profile.label} ID {source_id:02d} PNG 12장 내보내기 완료")
+
+        tree.bind("<<TreeviewSelect>>", refresh_preview)
+        buttons = ttk.Frame(window)
+        buttons.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(buttons, text="현재 PenC1 슬롯에 12장 복사", command=copy_to_current_slot).pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Button(buttons, text="선택 ID 12장 PNG 내보내기", command=export_pngs).pack(
+            side=tk.LEFT, padx=6
+        )
+        ttk.Button(buttons, text="닫기", command=window.destroy).pack(side=tk.RIGHT)
+        tree.selection_set("0")
+        tree.focus("0")
+        refresh_preview()
+        self.update_status(f"소스 ROM 인식: {source.profile.label} / {source.path.name}")
+
+
+    def refresh_sprite_previews(self) -> None:
+        if self.project is None or not self.base_images:
+            return
+        from PIL import ImageTk
+
+        slot = self.project.slots[self.current_id]
+        self.preview_cache = []
+        for i, ref in enumerate(slot.frames):
+            try:
+                pil = self._resolve_pil(ref)
+                preview = pil.resize((96, 96), Image.Resampling.NEAREST)
+                photo = ImageTk.PhotoImage(preview)
+                self.preview_cache.append(photo)
+                self.sprite_image_labels[i].configure(image=photo, text="")
+                if ref.kind == "file":
+                    source = Path(str(ref.value)).name
+                elif ref.kind == "embedded":
+                    source = "embedded"
+                else:
+                    source = f"{ref.kind}:{int(ref.value)}"
+                self.sprite_source_vars[i].set(source)
+            except Exception as exc:
+                self.preview_cache.append(None)
+                self.sprite_image_labels[i].configure(image="", text=f"오류\n{exc}")
+                self.sprite_source_vars[i].set("읽기 실패")
+
+
+    def replace_single_frame(self, frame_index: int) -> None:
+        from tkinter import filedialog
+
+        if self.project is None:
+            return
+        path = filedialog.askopenfilename(
+            title=f"ID {self.current_id:02d} 프레임 {frame_index:02d} 교체",
+            filetypes=[("PNG 이미지", "*.png"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with Image.open(path) as im:
+                core__pil_to_rgb565(im)
+            self.project.slots[self.current_id].frames[frame_index] = core__FrameRef(
+                "file", str(Path(path).resolve())
+            )
+            self.dirty = True
+            self.refresh_sprite_previews()
+            self.update_status(f"ID {self.current_id:02d} 프레임 {frame_index:02d} 교체")
+        except Exception as exc:
+            self.show_error("스프라이트 교체 실패", exc)
+
+
+    def select_slot(self, slot_id: int) -> None:
+        iid = str(slot_id)
+        if self.roster_tree.exists(iid):
+            self.roster_tree.selection_set(iid)
+            self.roster_tree.focus(iid)
+            self.roster_tree.see(iid)
+            self.load_slot(slot_id)
+
+    @staticmethod
+    def numbered_pngs(directory: Path) -> list[Path]:
+        candidates: list[tuple[int, str, Path]] = []
+        for p in directory.iterdir():
+            if not p.is_file() or p.suffix.lower() != ".png":
+                continue
+            stem = p.stem
+            match = re.search("(\\d+)$", stem)
+            if match:
+                number = int(match.group(1))
+                candidates.append((number, p.name.lower(), p))
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        by_number: dict[int, Path] = {}
+        for number, _name, p in candidates:
+            if 0 <= number < core__FRAMES_PER_DIGIMON and number not in by_number:
+                by_number[number] = p
+        missing = [i for i in range(core__FRAMES_PER_DIGIMON) if i not in by_number]
+        if missing:
+            raise ValueError(
+                "폴더에 번호가 붙은 PNG 12장이 필요합니다. 누락: "
+                + ", ".join((f"{x:02d}" for x in missing))
+            )
+        return [by_number[i] for i in range(core__FRAMES_PER_DIGIMON)]
+
+    def import_sprite_folder(self) -> None:
+        from tkinter import filedialog
+
+        if self.project is None:
+            return
+        directory = filedialog.askdirectory(title="00~11 PNG가 있는 폴더 선택")
+        if not directory:
+            return
+        try:
+            files = self.numbered_pngs(Path(directory))
+            for p in files:
+                with Image.open(p) as im:
+                    core__pil_to_rgb565(im)
+            self.project.slots[self.current_id].frames = [
+                core__FrameRef("file", str(p.resolve())) for p in files
+            ]
+            self.dirty = True
+            self.refresh_sprite_previews()
+            self.update_status(f"ID {self.current_id:02d}: 번호순 00–11 PNG를 가져왔습니다")
+        except Exception as exc:
+            self.show_error("폴더 가져오기 실패", exc)
+
+    def add_condition(self) -> None:
+        if self.project is None:
+            return
+        condition = self.condition_dialog()
+        if condition is None:
+            return
+        conditions = self.project.slots[self.current_id].evolution.conditions
+        if condition.kind == 0:
+            conditions[:] = [condition]
+        else:
+            conditions[:] = [x for x in conditions if x.kind != 0]
+            conditions.append(condition)
+        self.dirty = True
+        self.refresh_conditions()
+
+
+    def condition_dialog(
+        self, existing: Optional[EvolutionCondition] = None
+    ) -> Optional[core__EvolutionCondition]:
+        tk, ttk = (self.tk, self.ttk)
+        from tkinter import messagebox
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("진화 조건")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        kind_items = [f"{k:02d} {v}" for k, v in core__CONDITION_NAMES_KO.items()]
+        op_items = [f"{k} {v}" for k, v in core__OPERATOR_SYMBOL.items()]
+        kind_default = existing.kind if existing else 0
+        kind_var = tk.StringVar(
+            value=next((x for x in kind_items if x.startswith(f"{kind_default:02d} ")))
+        )
+        op_default = existing.operator if existing else 5
+        op_var = tk.StringVar(
+            value=next((x for x in op_items if x.startswith(str(op_default) + " ")))
+        )
+        value_var = tk.StringVar(value=str(existing.value if existing else 0))
+        result: list[Optional[core__EvolutionCondition]] = [None]
+        ttk.Label(dialog, text="조건 종류").grid(row=0, column=0, padx=8, pady=8, sticky="e")
+        kind_combo = ttk.Combobox(
+            dialog, textvariable=kind_var, values=kind_items, state="readonly", width=28
+        )
+        kind_combo.grid(row=0, column=1, padx=8, pady=8)
+        ttk.Label(dialog, text="비교").grid(row=1, column=0, padx=8, pady=8, sticky="e")
+        op_combo = ttk.Combobox(
+            dialog, textvariable=op_var, values=op_items, state="readonly", width=12
+        )
+        op_combo.grid(row=1, column=1, padx=8, pady=8, sticky="w")
+        ttk.Label(dialog, text="값").grid(row=2, column=0, padx=8, pady=8, sticky="e")
+        value_entry = ttk.Entry(dialog, textvariable=value_var, width=14)
+        value_entry.grid(row=2, column=1, padx=8, pady=8, sticky="w")
+        hint_var = tk.StringVar()
+        ttk.Label(dialog, textvariable=hint_var).grid(row=3, column=0, columnspan=2, padx=8, pady=4)
+
+        def update_state(*_args: Any) -> None:
+            kind = int(kind_var.get().split()[0])
+            if kind == 0:
+                op_combo.configure(state="disabled")
+                value_entry.configure(state="disabled")
+                hint_var.set("항상 조건은 다른 조건과 함께 사용할 수 없습니다")
+            else:
+                op_combo.configure(state="readonly")
+                value_entry.configure(state="normal")
+                max_v = 1 if kind in (11, 12) else 63
+                hint_var.set(
+                    f"허용 값: 0~{max_v} | {core__OPERATOR_DESCRIPTION_KO[int(op_var.get().split()[0])]}"
+                )
+
+        kind_combo.bind("<<ComboboxSelected>>", update_state)
+        op_combo.bind("<<ComboboxSelected>>", update_state)
+        update_state()
+        btns = ttk.Frame(dialog)
+        btns.grid(row=4, column=0, columnspan=2, pady=10)
+
+        def accept() -> None:
+            try:
+                kind = int(kind_var.get().split()[0])
+                if kind == 0:
+                    cond = core__EvolutionCondition(0, 5, 0)
+                else:
+                    operator = int(op_var.get().split()[0])
+                    value = int(value_var.get(), 0)
+                    cond = core__EvolutionCondition(kind, operator, value)
+                cond.validate()
+                result[0] = cond
+                dialog.destroy()
+            except Exception as exc:
+                messagebox.showerror("조건 오류", str(exc), parent=dialog)
+
+        ttk.Button(btns, text="확인", command=accept).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btns, text="취소", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        dialog.wait_window()
+        return result[0]
+
+    def confirm_discard(self) -> bool:
+        from tkinter import messagebox
+
+        return messagebox.askyesno(
+            "변경 내용 폐기", "저장하지 않은 변경 내용을 버리시겠습니까?", parent=self.root
+        )
+
+    def copy_sprite_from_slot(self) -> None:
+        from tkinter import simpledialog
+
+        if self.project is None:
+            return
+        source_id = simpledialog.askinteger(
+            "스프라이트 복사", "복사할 슬롯 ID", minvalue=0, maxvalue=core__MAX_ID, parent=self.root
+        )
+        if source_id is None:
+            return
+        self.project.slots[self.current_id].frames = copy.deepcopy(
+            self.project.slots[source_id].frames
+        )
+        self.dirty = True
+        self.refresh_sprite_previews()
+        self.update_status(
+            f"ID {source_id:02d}의 12개 프레임을 ID {self.current_id:02d}에 복사했습니다"
+        )
+
+    def delete_condition(self) -> None:
+        if self.project is None:
+            return
+        selected = self.condition_tree.selection()
+        if not selected:
+            return
+        index = int(selected[0])
+        del self.project.slots[self.current_id].evolution.conditions[index]
+        self.dirty = True
+        self.refresh_conditions()
+
+    def edit_condition(self) -> None:
+        if self.project is None:
+            return
+        selected = self.condition_tree.selection()
+        if not selected:
+            return
+        index = int(selected[0])
+        conditions = self.project.slots[self.current_id].evolution.conditions
+        replacement = self.condition_dialog(conditions[index])
+        if replacement is None:
+            return
+        if replacement.kind == 0:
+            conditions[:] = [replacement]
+        else:
+            conditions[index] = replacement
+            conditions[:] = [x for x in conditions if x.kind != 0]
+            if replacement not in conditions:
+                conditions.append(replacement)
+        self.dirty = True
+        self.refresh_conditions()
+
+    def export_sprite_folder(self) -> None:
+        from tkinter import filedialog
+
+        if self.project is None:
+            return
+        directory = filedialog.askdirectory(title="12개 PNG를 내보낼 폴더 선택")
+        if not directory:
+            return
+        try:
+            out = Path(directory)
+            out.mkdir(parents=True, exist_ok=True)
+            for i, ref in enumerate(self.project.slots[self.current_id].frames):
+                self._resolve_pil(ref).save(out / f"{i:02d}.png")
+            self.update_status(f"ID {self.current_id:02d} 스프라이트를 {out}에 내보냈습니다")
+        except Exception as exc:
+            self.show_error("스프라이트 내보내기 실패", exc)
+
+    def move_condition(self, direction: int) -> None:
+        if self.project is None:
+            return
+        selected = self.condition_tree.selection()
+        if not selected:
+            return
+        index = int(selected[0])
+        target = index + direction
+        conditions = self.project.slots[self.current_id].evolution.conditions
+        if not 0 <= target < len(conditions):
+            return
+        conditions[index], conditions[target] = (conditions[target], conditions[index])
+        self.dirty = True
+        self.refresh_conditions()
+        self.condition_tree.selection_set(str(target))
+
+    def refresh_conditions(self) -> None:
+        if self.project is None:
+            return
+        for item in self.condition_tree.get_children():
+            self.condition_tree.delete(item)
+        conditions = self.project.slots[self.current_id].evolution.conditions
+        for i, cond in enumerate(conditions):
+            if cond.kind == 0:
+                op, value = ("-", "-")
+            else:
+                op, value = (core__OPERATOR_SYMBOL[cond.operator], str(cond.value))
+            self.condition_tree.insert(
+                "",
+                "end",
+                iid=str(i),
+                values=(i + 1, core__CONDITION_NAMES_KO[cond.kind], op, value),
+            )
+        self.update_capacity()
+
+
+    def set_always_condition(self) -> None:
+        if self.project is None:
+            return
+        self.project.slots[self.current_id].evolution.conditions = [
+            core__EvolutionCondition(0, 5, 0)
+        ]
+        self.dirty = True
+        self.refresh_conditions()
+
+    def show_error(self, title: str, exc: Exception) -> None:
+        from tkinter import messagebox
+
+        messagebox.showerror(title, f"{exc}\n\n{traceback.format_exc(limit=3)}", parent=self.root)
+        self.update_status(f"오류: {exc}")
+
+
+import argparse
+import copy
+import json
+import os
+import struct
+import sys
+import traceback
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Any, Optional
+
+universal__APP_VERSION = "2.0.0"
+universal__PROJECT_FORMAT = "PenCUniversalProject\x566"
+universal__PROJECT_ROSTER_COUNT = 63
+universal__STANDARD_ROSTER_COUNT = 45
+universal__EXTENDED_ROSTER_COUNT = 63
+universal__EXTENDED_ROM_SIZE = 16777216
+universal__STOCK_ROM_SIZE = 8388608
+universal__FLASH_BANK1 = 4194304
+universal__SAVE_TAIL_START = 8376320
+universal__SAVE_TAIL_END = 8388608
+universal__METADATA_OFFSET = 167424
+universal__METADATA_SIZE = 4096
+universal__METADATA_MAGIC = b"PCU\x566M01"
+universal__ALBUM_VISIBILITY_CAVE = 171520
+universal__ALBUM_VISIBILITY_ORIGINAL_COPY = 171648
+universal__ALBUM_VISIBILITY_CAVE_END = 171904
+universal__ALBUM_CURSOR_CAVE = 171904
+universal__FINAL_STAT_TABLE = 176128
+universal__JOGRESS_POINTER_TABLE = 180224
+universal__JOGRESS_ROWS = 180736
+universal__JOGRESS_SPECIAL_DATA = 182272
+universal__JOGRESS_SPECIAL_END = 184320
+universal__CUTIN_FLAG = 188400
+universal__RELOCATED_SIZE_TABLE = 188928
+universal__EVOLUTION_CAVE = 196608
+universal__EVOLUTION_CAVE_END = 229376
+
+
+@dataclass(frozen=True)
+class universal__UniversalProfile:
+    version: int
+    label: str
+    stock_roster_count: int
+    stock_image_count: int
+    stock_size_table: int
+    stock_sha256: str
+    evolution_hook: int
+    evolution_return: int
+    evolution_result_return: int
+    stat_lookup_site: int
+    stat_lookup_function: int
+    album_cursor_hook: int
+    album_cursor_return: int
+    roster_max_offsets: tuple[int, ...]
+    image_max_offsets: tuple[int, ...]
+    size_table_sites: tuple[int, ...]
+    jogress_pointer_load_site: int
+    jogress_stage_mismatch_site: int
+    special_jogress_hook: int
+    special_jogress_fallback: int
+    special_jogress_stack: int
+    album_visibility_function: int
+    album_visibility_max_site: int
+
+    @property
+    def album_visibility_function_end(self) -> int:
+        return self.album_visibility_function + 82
+
+
+universal__PROFILES: dict[int, universal__UniversalProfile] = {
+    0: universal__UniversalProfile(
+        0,
+        "PenC0 / VP0",
+        33,
+        771,
+        66158,
+        "710f0ae26c11c42e379c1fa8b4c87c3673b2927cfb23d6efcde30600866a6acf",
+        59022,
+        59028,
+        59960,
+        133690,
+        133652,
+        22338,
+        22342,
+        (
+            5594,
+            16064,
+            22282,
+            22358,
+            31764,
+            33730,
+            47358,
+            45100,
+            45186,
+            45264,
+            45352,
+            47926,
+            48992,
+            49092,
+            49256,
+            122464,
+            133662,
+        ),
+        (103432, 104594, 125054, 125104),        (103612, 103692, 104756, 104830),
+        5462,
+        5434,
+        5100,
+        5392,
+        2,
+        45312,
+        45352,
+    ),
+    1: universal__UniversalProfile(
+        1,
+        "PenC1 / VP1",
+        32,
+        759,
+        64796,
+        "0a87352b39c9a93c5b9e0ee53e84a02c35b07021a15b3a2a7c1486f8d96de747",
+        48218,
+        48224,
+        48778,
+        133654,
+        133616,
+        21886,
+        21890,
+        (
+            3814,
+            15786,
+            21916,
+            21992,
+            31398,
+            33364,
+            40602,
+            46480,
+            46566,
+            46644,
+            46732,
+            49378,
+            50444,
+            50544,
+            50708,
+            120516,
+            133626,
+        ),
+        (101484, 102646, 123106, 123156),
+        (101664, 101744, 102808, 102882),
+        3720,
+        3712,
+        3420,
+        3648,
+        3,
+        46692,
+        46732,
+    ),
+    2: universal__UniversalProfile(
+        2,
+        "PenC2 / VP2",
+        32,
+        759,
+        64730,
+        "17700a7aa8f6a7747f0ba3f3dc0f3ec4a1b91fe6176f3bf86c3d9362099f9472",
+        50502,
+        50508,
+        51080,
+        133654,
+        133616,
+        21802,
+        21806,
+        (
+            3336,
+            15702,
+            21832,
+            21908,
+            31314,
+            33280,
+            40518,
+            46396,
+            46482,
+            46560,
+            46648,
+            46934,
+            48000,
+            48100,
+            48264,
+            120450,
+            133626,
+        ),
+        (101418, 102580, 123040, 123090),
+        (101598, 101678, 102742, 102816),
+        3242,
+        3234,
+        3026,
+        3170,
+        3,
+        46608,
+        46648,
+    ),
+    3: universal__UniversalProfile(
+        3,
+        "PenC3 / VP3",
+        32,
+        759,
+        64736,
+        "a15ce4e72847ec7d5d620d99c2d51cd51c73df13bc8eb78d20d590191d60e607",
+        48158,
+        48164,
+        48718,
+        133654,
+        133616,
+        21826,
+        21830,
+        (
+            3360,
+            15726,
+            21856,
+            21932,
+            31338,
+            33304,
+            40542,
+            46420,
+            46506,
+            46584,
+            46672,
+            49318,
+            50384,
+            50484,
+            50648,
+            120456,
+            133626,
+        ),
+        (101424, 102586, 123046, 123096),
+        (101604, 101684, 102748, 102822),
+        3266,
+        3258,
+        3026,
+        3194,
+        3,
+        46632,
+        46672,
+    ),
+    4: universal__UniversalProfile(
+        4,
+        "PenC4 / VP4",
+        32,
+        759,
+        65932,
+        "b8f4e67537805e7d02b7d3e498a9f3cff694880b86576afb9a36241f61f6fe83",
+        56266,
+        56272,
+        57096,
+        133654,
+        133616,
+        22136,
+        22140,
+        (
+            4452,
+            15958,
+            22166,
+            22242,
+            31648,
+            33614,
+            47236,
+            44978,
+            45064,
+            45142,
+            45230,
+            47804,
+            48870,
+            48970,
+            49134,
+            122018,
+            133626,
+        ),
+        (102986, 104148, 124608, 124658),
+        (103166, 103246, 104310, 104384),
+        4320,
+        4292,
+        4022,
+        4250,
+        2,
+        45190,
+        45230,
+    ),
+    5: universal__UniversalProfile(
+        5,
+        "PenC5 / VP5",
+        32,
+        759,
+        65944,
+        "446cfad6d80c8817cb786c441ff27e5c9ce4847b2f7c26174cd3495f2145145d",
+        56290,
+        56296,
+        57108,
+        133654,
+        133616,
+        22154,
+        22158,
+        (
+            4976,
+            15976,
+            22184,
+            22260,
+            31666,
+            33632,
+            47260,
+            45002,
+            45088,
+            45166,
+            45254,
+            47828,
+            48894,
+            48994,
+            49158,
+            122030,
+            133626,
+        ),
+        (102998, 104160, 124620, 124670),
+        (103178, 103258, 104322, 104396),
+        4844,
+        4816,
+        4528,
+        4774,
+        2,
+        45214,
+        45254,
+    ),
+}
+
+
+@dataclass
+class universal__RomLayout:
+    profile: universal__UniversalProfile
+    roster_count: int
+    image_count: int
+    stat_table: int
+    size_table: int
+    mode: str
+
+
+def universal__activate(profile: UniversalProfile, target_count: int) -> None:
+
+    if target_count not in (universal__STANDARD_ROSTER_COUNT, universal__EXTENDED_ROSTER_COUNT):
+        raise ValueError(f"지원하지 않는 로스터 수: {target_count}")
+    globals()["core__ROSTER_COUNT"] = target_count
+    globals()["core__MAX_ID"] = target_count - 1
+    globals()["core__ORIGINAL_ROSTER_COUNT"] = profile.stock_roster_count
+    globals()["core__ADDED_ROSTER_COUNT"] = target_count - profile.stock_roster_count
+    globals()["core__VANILLA_IMAGE_COUNT"] = profile.stock_image_count
+    globals()["core__FINAL_IMAGE_COUNT"] = (
+        profile.stock_image_count + core__ADDED_ROSTER_COUNT * core__FRAMES_PER_DIGIMON
+    )
+    globals()["core__NO_RESULT_ID"] = target_count
+    globals()["core__ORIGINAL_SIZE_TABLE"] = profile.stock_size_table
+    globals()["core__RELOCATED_SIZE_TABLE"] = universal__RELOCATED_SIZE_TABLE
+    globals()["core__ORIGINAL_STAT_TABLE"] = 131390
+    globals()["core__FINAL_STAT_TABLE"] = universal__FINAL_STAT_TABLE
+    globals()["core__STAT_LOOKUP_SITE"] = profile.stat_lookup_site
+    globals()["core__CUTIN_FLAG"] = universal__CUTIN_FLAG
+    globals()["core__METADATA_OFFSET"] = universal__METADATA_OFFSET
+    globals()["core__METADATA_SIZE"] = universal__METADATA_SIZE
+    globals()["core__ALBUM_HOOK"] = profile.album_cursor_hook
+    globals()["core__ALBUM_RETURN"] = profile.album_cursor_return
+    globals()["core__ALBUM_CAVE"] = universal__ALBUM_CURSOR_CAVE
+    globals()["core__ALBUM_VISIBILITY_FUNCTION"] = profile.album_visibility_function
+    globals()["core__ALBUM_VISIBILITY_FUNCTION_END"] = profile.album_visibility_function_end
+    globals()["core__ALBUM_VISIBILITY_CAVE"] = universal__ALBUM_VISIBILITY_CAVE
+    globals()["core__ALBUM_VISIBILITY_ORIGINAL_COPY"] = universal__ALBUM_VISIBILITY_ORIGINAL_COPY
+    globals()["core__ALBUM_VISIBILITY_CAVE_END"] = universal__ALBUM_VISIBILITY_CAVE_END
+    globals()["core__EVO_HOOK"] = profile.evolution_hook
+    globals()["core__EVO_HOOK_RETURN"] = profile.evolution_return
+    globals()["core__EVO_RESULT_RETURN"] = profile.evolution_result_return
+    globals()["core__EVO_CAVE"] = universal__EVOLUTION_CAVE
+    globals()["core__EVO_CAVE_END"] = universal__EVOLUTION_CAVE_END
+    globals()["core__JOGRESS_STAGE_MISMATCH_SITE"] = profile.jogress_stage_mismatch_site
+    globals()["core__JOGRESS_POINTER_LOAD_SITE"] = profile.jogress_pointer_load_site
+    globals()["core__JOGRESS_POINTER_TABLE"] = universal__JOGRESS_POINTER_TABLE
+    globals()["core__JOGRESS_ROWS"] = universal__JOGRESS_ROWS
+    globals()["core__JOGRESS_SPECIAL_HOOK"] = profile.special_jogress_hook
+    globals()["core__JOGRESS_SPECIAL_DATA"] = universal__JOGRESS_SPECIAL_DATA
+    globals()["core__JOGRESS_SPECIAL_END"] = universal__JOGRESS_SPECIAL_END
+    globals()["core__ROSTER_MAX_OFFSETS"] = list(profile.roster_max_offsets)
+    globals()["core__IMAGE_MAX_OFFSETS"] = list(profile.image_max_offsets)
+    globals()["core__SIZE_TABLE_ADDRESS_SITES"] = list(profile.size_table_sites)
+    globals()["core__EXPECTED_SHA256"] = profile.stock_sha256
+    globals()["core__DEFAULT_NEW_SLOT_TEMPLATE_ID"] = profile.stock_roster_count - 1
+
+
+def universal___call_words_for_raw(raw_offset: int) -> tuple[int, int]:
+    word_address = 2097152 + raw_offset // 2
+    return (61536 | word_address >> 16 & 1, word_address & 65535)
+
+
+def universal___read_metadata(data: bytes) -> Optional[dict[str, Any]]:
+    if len(data) < universal__METADATA_OFFSET + len(universal__METADATA_MAGIC) + 4:
+        return None
+    if (
+        data[
+            universal__METADATA_OFFSET : universal__METADATA_OFFSET + len(universal__METADATA_MAGIC)
+        ]
+        != universal__METADATA_MAGIC
+    ):
+        return None
+    size = core__read_u32(data, universal__METADATA_OFFSET + len(universal__METADATA_MAGIC))
+    if size <= 0 or size > universal__METADATA_SIZE - len(universal__METADATA_MAGIC) - 4:
+        return None
+    start = universal__METADATA_OFFSET + len(universal__METADATA_MAGIC) + 4
+    try:
+        return json.loads(data[start : start + size].decode("utf-8"))
+    except Exception:
+        return None
+
+
+def universal__album_visibility_wrapper_words(profile: UniversalProfile) -> list[int]:
+    goto_original = core__far_goto_words(universal__ALBUM_VISIBILITY_ORIGINAL_COPY)
+    call = universal___call_words_for_raw(profile.stat_lookup_function)
+    return [
+        55944,
+        8258,
+        2824,
+        1,
+        8258,
+        38405,
+        2312,
+        1,
+        54980,
+        38478,
+        2312,
+        2,
+        54980,
+        call[0],
+        call[1],
+        66,
+        16960,
+        24066,
+        66,
+        39064,
+        66,
+        goto_original[0],
+        goto_original[1],
+    ]
+
+
+def universal__build_universal_rom(
+    project: core.Project, source: bytes, layout: RomLayout, target_count: int, extended: bool
+) -> tuple[bytes, dict[str, Any]]:
+    profile = layout.profile
+    universal__activate(profile, target_count)
+    build_project = core__Project(
+        slots=copy.deepcopy(project.slots[:target_count]), rom_files=dict(project.rom_files)
+    )
+    core__validate_project(build_project)
+    source_images = universal__read_images_flexible(source, layout.image_count, layout.size_table)
+    if len(source_images) < profile.stock_image_count:
+        raise ValueError("기반 ROM의 이미지 수가 원본 이미지 수보다 작습니다")
+    if extended:
+        output = bytearray(b"\xff" * universal__EXTENDED_ROM_SIZE)
+        output[:universal__STOCK_ROM_SIZE] = source[:universal__STOCK_ROM_SIZE]
+    else:
+        output = bytearray(source[:universal__STOCK_ROM_SIZE])
+    save_before = bytes(source[universal__SAVE_TAIL_START:universal__SAVE_TAIL_END])
+    output[universal__METADATA_OFFSET:229376] = b"\x00" * (229376 - universal__METADATA_OFFSET)
+    output[universal__CUTIN_FLAG] = 0
+    final_images = list(source_images[: profile.stock_image_count])
+    final_stats: list[list[int]] = []
+    for slot in build_project.slots:
+        stats = list(slot.stats)
+        if slot.digimon_id < profile.stock_roster_count:
+            sprite_start = 240 + slot.digimon_id * core__FRAMES_PER_DIGIMON
+            stats[0] = sprite_start
+            if slot.digimon_id < layout.roster_count:
+                stats[core__ALBUM_ORDER_STAT_INDEX] = core__read_stat_words(
+                    source, slot.digimon_id, layout.stat_table
+                )[core__ALBUM_ORDER_STAT_INDEX]
+            for j, ref in enumerate(slot.frames):
+                final_images[sprite_start + j] = core__resolve_frame(ref, source_images)
+        else:
+            sprite_start = (
+                profile.stock_image_count
+                + (slot.digimon_id - profile.stock_roster_count) * core__FRAMES_PER_DIGIMON
+            )
+            stats[0] = sprite_start
+            stats[core__ALBUM_ORDER_STAT_INDEX] = slot.digimon_id
+            for ref in slot.frames:
+                final_images.append(core__resolve_frame(ref, source_images))
+        final_stats.append(stats)
+    expected_images = (
+        profile.stock_image_count
+        + (target_count - profile.stock_roster_count) * core__FRAMES_PER_DIGIMON
+    )
+    if len(final_images) != expected_images:
+        raise AssertionError(f"최종 이미지 수 오류: {len(final_images)} != {expected_images}")
+    image_end, upper_start = universal__write_images_universal(output, final_images, extended)
+    for slot, stats in zip(build_project.slots, final_stats):
+        core__write_stat_words(output, slot.digimon_id, stats, universal__FINAL_STAT_TABLE)
+    core__write_u16(output, profile.stat_lookup_site, universal__FINAL_STAT_TABLE // 2 & 65535)
+    for off in profile.roster_max_offsets:
+        core__write_immediate6(output, off, target_count - 1)
+    for off in profile.image_max_offsets:
+        core__write_u16(output, off, expected_images - 1)
+    for off in profile.size_table_sites:
+        core__write_u16(output, off, 28928)
+        core__write_u16(output, off + 2, 39009)
+    core__patch_album_cursor(output)
+    universal__patch_album_visibility(output, source, profile, target_count - 1)
+    evolution_report = core__patch_evolution(output, build_project.slots)
+    universal__patch_attribute_jogress_universal(output, source, layout, target_count)
+    universal__write_metadata(
+        output, profile, target_count, expected_images, "extended16" if extended else "standard8"
+    )
+    if output[universal__SAVE_TAIL_START:universal__SAVE_TAIL_END] != save_before:
+        raise AssertionError("기존 저장영역 0x7F\x44000~0x7FFFFF가 변경되었습니다")
+    if core__detect_image_count(output) != expected_images:
+        raise AssertionError("이미지 포인터 수 검증 실패")
+    if core__read_u16(output, profile.stat_lookup_site) != universal__FINAL_STAT_TABLE // 2 & 65535:
+        raise AssertionError("스탯표 주소 패치 실패")
+    for off in profile.roster_max_offsets:
+        if off == profile.album_visibility_max_site:
+            copied_off = universal__ALBUM_VISIBILITY_ORIGINAL_COPY + (
+                off - profile.album_visibility_function
+            )
+            if core__read_u16(output, copied_off) & 63 != target_count - 1:
+                raise AssertionError(f"앨범 표시 상한 복사 패치 실패: {off:#x}")
+            continue
+        if core__read_u16(output, off) & 63 != target_count - 1:
+            raise AssertionError(f"로스터 상한 패치 실패: {off:#x}")
+    for off in profile.image_max_offsets:
+        if core__read_u16(output, off) != expected_images - 1:
+            raise AssertionError(f"이미지 상한 패치 실패: {off:#x}")
+    report = {
+        "format": "PenC Universal Editor \x566 build report",
+        "app_version": universal__APP_VERSION,
+        "profile": profile.label,
+        "profile_version": profile.version,
+        "mode": "MX25L12833F 16 MiB extended" if extended else "standard 8 MiB",
+        "rom_size": len(output),
+        "roster_count": target_count,
+        "max_id": target_count - 1,
+        "reserved_no_result_id": target_count,
+        "stock_roster_count": profile.stock_roster_count,
+        "stock_image_count": profile.stock_image_count,
+        "total_image_count": expected_images,
+        "image_end": image_end,
+        "upper_flash_image_start": upper_start,
+        "save_tail_preserved": True,
+        "album": {
+            "visibility": "stat[14] OR original runtime visibility bit",
+            "locked_sprite": "original acquired-bit/lock-image path retained",
+            "stat14_editable": True,
+        },
+        "evolution": evolution_report,
+        "source_sha256": core__sha256(source),
+        "output_sha256": core__sha256(output),
+        "hardware_note": "16 MiB output uses image pointer offsets above 0x7FFFFF; real-device MX25L12833F validation is required.",
+    }
+    return (bytes(output), report)
+
+
+def universal__create_project_from_rom(
+    path: Path,
+) -> tuple[core__Project, bytes, list[core__RomImage], universal__RomLayout]:
+    data = path.read_bytes()
+    layout = universal__identify_layout(data)
+    universal__activate(layout.profile, universal__PROJECT_ROSTER_COUNT)
+    images = universal__read_images_flexible(data, layout.image_count, layout.size_table)
+    slots: list[core__DigimonSlot] = []
+    current_count = min(layout.roster_count, universal__PROJECT_ROSTER_COUNT)
+    for digimon_id in range(current_count):
+        stats = core__read_stat_words(data, digimon_id, layout.stat_table)
+        start = stats[0]
+        if start + core__FRAMES_PER_DIGIMON > len(images):
+            raise ValueError(f"ID {digimon_id:02d}: 스프라이트 시작 번호 오류 {start}")
+        frames = [core__FrameRef("base", start + i) for i in range(core__FRAMES_PER_DIGIMON)]
+        if layout.profile.version == 1 and digimon_id < len(core__DEFAULT_DISPLAY_NAMES):
+            name = core__DEFAULT_DISPLAY_NAMES[digimon_id]
+        else:
+            name = f"{layout.profile.label.split('/')[0].strip()} ID {digimon_id:02d}"
+        slots.append(core__DigimonSlot(digimon_id, name, stats, frames, core__EvolutionRoute()))
+    template_id = max(0, current_count - 1)
+    template_stats = list(slots[template_id].stats)
+    template_frames = copy.deepcopy(slots[template_id].frames)
+    for digimon_id in range(current_count, universal__PROJECT_ROSTER_COUNT):
+        stats = list(template_stats)
+        stats[core__ALBUM_ORDER_STAT_INDEX] = digimon_id
+        stats[core__ALBUM_VISIBLE_STAT_INDEX] = 1
+        slots.append(
+            core__DigimonSlot(
+                digimon_id,
+                f"추가 슬롯 {digimon_id:02d}",
+                stats,
+                copy.deepcopy(template_frames),
+                core__EvolutionRoute(False, 0, []),
+            )
+        )
+    project = core__Project(
+        slots=slots,
+        rom_files={"vanilla": str(path.resolve()), "profile_version": str(layout.profile.version)},
+    )
+    return (project, data, images, layout)
+
+
+def universal__identify_layout(data: bytes) -> universal__RomLayout:
+    if len(data) not in (universal__STOCK_ROM_SIZE, universal__EXTENDED_ROM_SIZE):
+        raise ValueError(f"지원 ROM 크기가 아닙니다: {len(data):#x} (8 MiB 또는 16 MiB 필요)")
+    meta = universal___read_metadata(data)
+    if meta and meta.get("format") == universal__PROJECT_FORMAT:
+        version = int(meta["profile_version"])
+        profile = universal__PROFILES[version]
+        return universal__RomLayout(
+            profile=profile,
+            roster_count=int(meta["roster_count"]),
+            image_count=int(meta["image_count"]),
+            stat_table=int(meta.get("stat_table", universal__FINAL_STAT_TABLE)),
+            size_table=int(meta.get("size_table", universal__RELOCATED_SIZE_TABLE)),
+            mode=str(meta.get("mode", "patched")),
+        )
+    if len(data) != universal__STOCK_ROM_SIZE:
+        raise ValueError("16 MiB ROM에 \x566 메타데이터가 없어 버전을 안전하게 판별할 수 없습니다")
+    detected = core__detect_penc_profile(data)
+    profile = universal__PROFILES[detected.version]
+    return universal__RomLayout(
+        profile,
+        profile.stock_roster_count,
+        profile.stock_image_count,
+        131390,
+        profile.stock_size_table,
+        "stock",
+    )
+
+
+def universal__load_universal_project(
+    path: Path,
+) -> tuple[core__Project, bytes, list[core__RomImage], universal__RomLayout]:
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if obj.get("format") != universal__PROJECT_FORMAT:
+        legacy = core__load_project(path)
+        version = 1
+        base_text = legacy.rom_files.get("vanilla", "PenC1.bin")
+        base = Path(base_text)
+        if not base.is_absolute():
+            base = (path.parent / base).resolve()
+        temp_project, data, images, layout = universal__create_project_from_rom(base)
+        for i, slot in enumerate(legacy.slots[:universal__PROJECT_ROSTER_COUNT]):
+            temp_project.slots[i] = slot
+        temp_project.project_path = path
+        return (temp_project, data, images, layout)
+    version = int(obj["profile_version"])
+    base = Path(str(obj.get("base_rom", "")))
+    if not base.is_absolute():
+        base = (path.parent / base).resolve()
+    project, data, images, layout = universal__create_project_from_rom(base)
+    if layout.profile.version != version:
+        raise ValueError(f"프로젝트 버전 VP{version}과 기반 ROM {layout.profile.label}이 다릅니다")
+    loaded = [core__DigimonSlot.from_dict(x) for x in obj.get("slots", [])]
+    for i, slot in enumerate(loaded[:universal__PROJECT_ROSTER_COUNT]):
+        project.slots[i] = slot
+    project.project_path = path
+    project.rom_files = {"vanilla": str(base), "profile_version": str(version)}
+    return (project, data, images, layout)
+
+
+def universal__patch_album_visibility(
+    output: bytearray, source: bytes, profile: UniversalProfile, max_id: int
+) -> None:
+    words = universal__album_visibility_wrapper_words(profile)
+    wrapper = struct.pack("<" + "H" * len(words), *words)
+    output[universal__ALBUM_VISIBILITY_CAVE:universal__ALBUM_VISIBILITY_CAVE_END] = b"\x00" * (
+        universal__ALBUM_VISIBILITY_CAVE_END - universal__ALBUM_VISIBILITY_CAVE
+    )
+    output[universal__ALBUM_VISIBILITY_CAVE : universal__ALBUM_VISIBILITY_CAVE + len(wrapper)] = (
+        wrapper
+    )
+    expected_goto = struct.pack("<2H", *core__far_goto_words(universal__ALBUM_VISIBILITY_CAVE))
+    if (
+        source[profile.album_visibility_function : profile.album_visibility_function + 4]
+        == expected_goto
+    ):
+        original = bytearray(
+            source[
+                universal__ALBUM_VISIBILITY_ORIGINAL_COPY : universal__ALBUM_VISIBILITY_ORIGINAL_COPY
+                + 82
+            ]
+        )
+    else:
+        original = bytearray(
+            source[profile.album_visibility_function : profile.album_visibility_function_end]
+        )
+    core__write_immediate6(
+        original, profile.album_visibility_max_site - profile.album_visibility_function, max_id
+    )
+    output[
+        universal__ALBUM_VISIBILITY_ORIGINAL_COPY : universal__ALBUM_VISIBILITY_ORIGINAL_COPY
+        + len(original)
+    ] = original
+    output[profile.album_visibility_function : profile.album_visibility_function_end] = b"\x00" * 82
+    core__write_far_goto(
+        output, profile.album_visibility_function, universal__ALBUM_VISIBILITY_CAVE
+    )
+
+
+def universal__patch_attribute_jogress_universal(
+    output: bytearray, source: bytes, layout: RomLayout, target_count: int
+) -> None:
+    profile = layout.profile
+    if universal___read_metadata(source):
+        original_rows = [
+            [
+                core__read_u16(source, universal__JOGRESS_ROWS + source_id * 8 + i * 2)
+                for i in range(4)
+            ]
+            for source_id in range(profile.stock_roster_count)
+        ]
+    else:
+        original_rows = core__read_original_jogress_rows(source)
+    output[universal__JOGRESS_POINTER_TABLE:universal__JOGRESS_SPECIAL_DATA] = b"\x00" * (
+        universal__JOGRESS_SPECIAL_DATA - universal__JOGRESS_POINTER_TABLE
+    )
+    core__write_u16(
+        output, profile.jogress_pointer_load_site, universal__JOGRESS_POINTER_TABLE // 2 & 65535
+    )
+    core__write_immediate6(output, profile.jogress_stage_mismatch_site, target_count)
+    for source_id in range(target_count):
+        row_off = universal__JOGRESS_ROWS + source_id * 8
+        runtime_pointer = 2097152 + row_off // 2
+        core__write_u32(output, universal__JOGRESS_POINTER_TABLE + source_id * 4, runtime_pointer)
+        if source_id < profile.stock_roster_count:
+            values = [
+                target_count if x in (profile.stock_roster_count, 65535) else x
+                for x in original_rows[source_id]
+            ]
+        else:
+            values = [target_count] * 4
+        for i, value in enumerate(values):
+            core__write_u16(output, row_off + i * 2, value)
+
+
+def universal__project_to_dict(project: core.Project, profile_version: int) -> dict[str, Any]:
+    return {
+        "format": universal__PROJECT_FORMAT,
+        "app_version": universal__APP_VERSION,
+        "profile_version": profile_version,
+        "base_rom": project.rom_files.get("vanilla", ""),
+        "slots": [
+            {
+                "id": s.digimon_id,
+                "name": s.name,
+                "stats": s.stats,
+                "frames": [asdict(f) for f in s.frames],
+                "evolution": {
+                    "enabled": s.evolution.enabled,
+                    "source_id": s.evolution.source_id,
+                    "conditions": [asdict(c) for c in s.evolution.conditions],
+                },
+            }
+            for s in project.slots
+        ],
+    }
+
+
+def universal__read_images_flexible(
+    data: bytes, count: int, size_table: int
+) -> list[core__RomImage]:
+    if core__detect_image_count(data) != count:
+        raise ValueError(f"이미지 수 불일치: ROM={core__detect_image_count(data)}, 기대={count}")
+    images: list[core__RomImage] = []
+    minimum_start = universal__FLASH_BANK1 + count * 4
+    previous = minimum_start
+    for i in range(count):
+        rel = core__read_u32(data, universal__FLASH_BANK1 + i * 4)
+        w = core__read_u16(data, size_table + i * 4)
+        h = core__read_u16(data, size_table + i * 4 + 2)
+        if not (1 <= w <= 256 and 1 <= h <= 256):
+            raise ValueError(f"이미지 {i}: 크기 오류 {w}x{h}")
+        start = universal__FLASH_BANK1 + rel
+        end = start + w * h * 2
+        if start < minimum_start or end > len(data):
+            raise ValueError(f"이미지 {i}: 범위 오류 {start:#x}..{end:#x}")
+        if start < previous:
+            raise ValueError(f"이미지 {i}: 포인터 순서 오류")
+        if start < universal__SAVE_TAIL_END and end > universal__SAVE_TAIL_START:
+            raise ValueError(f"이미지 {i}: 저장 영역 침범")
+        images.append(core__RomImage(w, h, data[start:end]))
+        previous = end
+    return images
+
+
+def universal__save_universal_project(
+    project: core.Project, profile_version: int, path: Path
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    obj = universal__project_to_dict(project, profile_version)
+    base = Path(obj["base_rom"])
+    if base.is_absolute():
+        try:
+            obj["base_rom"] = os.path.relpath(base, path.parent).replace("\\", "/")
+        except ValueError:
+            pass
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    project.project_path = path
+
+
+def universal__write_images_universal(
+    data: bytearray, images: list[core.RomImage], extended: bool
+) -> tuple[int, Optional[int]]:
+    count = len(images)
+    cursor = universal__FLASH_BANK1 + count * 4
+    data[universal__FLASH_BANK1:universal__SAVE_TAIL_START] = b"\x00" * (
+        universal__SAVE_TAIL_START - universal__FLASH_BANK1
+    )
+    if extended:
+        data[universal__SAVE_TAIL_END:] = b"\xff" * (len(data) - universal__SAVE_TAIL_END)
+    data[universal__RELOCATED_SIZE_TABLE : universal__RELOCATED_SIZE_TABLE + count * 4] = (
+        b"\x00" * (count * 4)
+    )
+    upper_start: Optional[int] = None
+    for i, image in enumerate(images):
+        size = len(image.pixels)
+        if cursor < universal__SAVE_TAIL_END and cursor + size > universal__SAVE_TAIL_START:
+            if not extended:
+                raise ValueError(f"표준 8 MiB 이미지 공간 초과: 이미지 {i}에서 저장영역과 겹칩니다")
+            cursor = universal__SAVE_TAIL_END
+            upper_start = cursor
+        end = cursor + size
+        if end > len(data):
+            raise ValueError(f"이미지 {i} 기록 중 ROM 용량 초과: {end:#x} > {len(data):#x}")
+        core__write_u32(data, universal__FLASH_BANK1 + i * 4, cursor - universal__FLASH_BANK1)
+        core__write_u16(data, universal__RELOCATED_SIZE_TABLE + i * 4, image.width)
+        core__write_u16(data, universal__RELOCATED_SIZE_TABLE + i * 4 + 2, image.height)
+        data[cursor:end] = image.pixels
+        cursor = end
+    return (cursor, upper_start)
+
+
+def universal__write_metadata(
+    output: bytearray, profile: UniversalProfile, target_count: int, image_count: int, mode: str
+) -> None:
+    payload = json.dumps(
+        {
+            "format": universal__PROJECT_FORMAT,
+            "app_version": universal__APP_VERSION,
+            "profile_version": profile.version,
+            "profile_label": profile.label,
+            "roster_count": target_count,
+            "image_count": image_count,
+            "stat_table": universal__FINAL_STAT_TABLE,
+            "size_table": universal__RELOCATED_SIZE_TABLE,
+            "mode": mode,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(payload) + len(universal__METADATA_MAGIC) + 4 > universal__METADATA_SIZE:
+        raise ValueError("ROM 메타데이터 공간 초과")
+    output[universal__METADATA_OFFSET : universal__METADATA_OFFSET + universal__METADATA_SIZE] = (
+        b"\x00" * universal__METADATA_SIZE
+    )
+    output[
+        universal__METADATA_OFFSET : universal__METADATA_OFFSET + len(universal__METADATA_MAGIC)
+    ] = universal__METADATA_MAGIC
+    core__write_u32(
+        output, universal__METADATA_OFFSET + len(universal__METADATA_MAGIC), len(payload)
+    )
+    start = universal__METADATA_OFFSET + len(universal__METADATA_MAGIC) + 4
+    output[start : start + len(payload)] = payload
+
+
+class universal__UniversalEditorGUI(core__EditorGUI):
+
+    def __init__(self, root: Any, initial_project: Optional[Path] = None) -> None:
+        self.profile: Optional[universal__UniversalProfile] = None
+        self.layout: Optional[universal__RomLayout] = None
+        universal__activate(universal__PROFILES[1], universal__PROJECT_ROSTER_COUNT)
+        super().__init__(root, initial_project=None)
+        self.root.title(f"PenC0–PenC5 통합 로스터 편집기 V{universal__APP_VERSION}")
+        self._retitle_roster_label()
+        if initial_project:
+            self.open_project(initial_project)
+        else:
+            self.update_status("파일 → PenC ROM 열기에서 PenC0~PenC5 ROM을 선택하십시오")
+
+
+    def _open_rom(self, path: Path) -> None:
+        project, data, images, layout = universal__create_project_from_rom(path.resolve())
+        self.profile, self.layout = (layout.profile, layout)
+        universal__activate(self.profile, universal__PROJECT_ROSTER_COUNT)
+        globals()["core__ORIGINAL_STAT_TABLE"] = layout.stat_table
+        self.project = project
+        self.vanilla = data
+        self.base_images = images
+        self.rom_paths = {"vanilla": path.resolve()}
+        self.dirty = False
+        self.refresh_roster()
+        self.select_slot(0)
+        self.root.title(
+            f"{layout.profile.label} 통합 로스터 편집기 V{universal__APP_VERSION} - {path.name}"
+        )
+        self.update_status(
+            f"{layout.profile.label} 직접 편집 | 입력 {layout.roster_count}마리 / 프로젝트 63슬롯"
+        )
+
+
+    def build_rom_action(self) -> None:
+        self.build_rom_mode(False)
+
+
+    def new_project(self, auto: bool = False, rom_path: Optional[Path] = None) -> None:
+        if auto:
+            return
+        if rom_path:
+            self._open_rom(Path(rom_path))
+        else:
+            self.open_rom_dialog()
+
+
+    def open_project_dialog(self) -> None:
+        from tkinter import filedialog
+
+        if self.dirty and (not self.confirm_discard()):
+            return
+        chosen = filedialog.askopenfilename(
+            title="통합 프로젝트 열기",
+            filetypes=[("PenC 프로젝트", "*.json"), ("모든 파일", "*.*")],
+        )
+        if chosen:
+            self.open_project(Path(chosen))
+
+    def open_rom_dialog(self) -> None:
+        from tkinter import filedialog
+
+        if self.dirty and (not self.confirm_discard()):
+            return
+        chosen = filedialog.askopenfilename(
+            title="PenC0~PenC5 ROM 열기", filetypes=[("PenC ROM", "*.bin"), ("모든 파일", "*.*")]
+        )
+        if chosen:
+            try:
+                self._open_rom(Path(chosen))
+            except Exception as exc:
+                self.show_error("ROM 열기 실패", exc)
+
+    def refresh_roster(self) -> None:
+        if self.project is None:
+            return
+        for item in self.roster_tree.get_children():
+            self.roster_tree.delete(item)
+        stock = self.profile.stock_roster_count if self.profile else core__ORIGINAL_ROSTER_COUNT
+        for slot in self.project.slots:
+            if slot.digimon_id < stock:
+                kind = "기존"
+            elif slot.digimon_id < universal__STANDARD_ROSTER_COUNT:
+                kind = "8MB"
+            else:
+                kind = "16MB"
+            self.roster_tree.insert(
+                "",
+                "end",
+                iid=str(slot.digimon_id),
+                values=(f"{slot.digimon_id:02d}", slot.name, kind),
+            )
+        choices = [f"{s.digimon_id:02d}  {s.name}" for s in self.project.slots]
+        self.clone_slot_combo["values"] = choices
+        self.evo_source_combo["values"] = choices
+        if str(self.current_id) in self.roster_tree.get_children():
+            self.roster_tree.selection_set(str(self.current_id))
+
+    def reload_references(self) -> None:
+        from tkinter import filedialog
+
+        if self.project is None or self.profile is None:
+            return
+        chosen = filedialog.askopenfilename(
+            title="동일 버전 기반 ROM 다시 선택", filetypes=[("PenC ROM", "*.bin")]
+        )
+        if not chosen:
+            return
+        try:
+            data = Path(chosen).read_bytes()
+            layout = universal__identify_layout(data)
+            if layout.profile.version != self.profile.version:
+                raise ValueError(
+                    f"현재 프로젝트는 {self.profile.label}, 선택 ROM은 {layout.profile.label}입니다"
+                )
+            images = universal__read_images_flexible(data, layout.image_count, layout.size_table)
+            self.vanilla, self.base_images, self.layout = (data, images, layout)
+            self.project.rom_files["vanilla"] = str(Path(chosen).resolve())
+            self.rom_paths = {"vanilla": Path(chosen).resolve()}
+            self.refresh_sprite_previews()
+            self.dirty = True
+            self.update_status(f"기반 ROM 교체: {Path(chosen).name}")
+        except Exception as exc:
+            self.show_error("기반 ROM 교체 실패", exc)
+
+    def save_project_action(self, save_as: bool = False) -> None:
+        from tkinter import filedialog
+
+        if self.project is None or self.profile is None:
+            return
+        try:
+            self.commit_current_slot()
+            core__validate_project(self.project)
+            path = self.project.project_path
+            if save_as or path is None:
+                chosen = filedialog.asksaveasfilename(
+                    title="통합 프로젝트 저장",
+                    defaultextension=".json",
+                    filetypes=[("PenC 통합 프로젝트", "*.json")],
+                    initialfile=f"PenC{self.profile.version}_63_project.json",
+                )
+                if not chosen:
+                    return
+                path = Path(chosen)
+            universal__save_universal_project(self.project, self.profile.version, path)
+            self.dirty = False
+            self.update_status(f"프로젝트 저장: {path.name}")
+        except Exception as exc:
+            self.show_error("프로젝트 저장 실패", exc)
+
+
+import argparse, copy, json, os, struct, sys, traceback
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Optional
+
+relocation__APP_VERSION = "3.1.0"
+relocation__PROJECT_FORMAT = "PenCUniversalProject\x568"
+relocation__PROJECT_ROSTER_COUNT = 266
+relocation__STANDARD_ROSTER_COUNT = 114
+relocation__EXTENDED_ROSTER_COUNT = 266
+relocation__STOCK_ROM_SIZE = 8388608
+relocation__EXTENDED_ROM_SIZE = 16777216
+relocation__FLASH_BANK1 = 4194304
+relocation__BANK0_IMAGE_START = 397312
+relocation__SAVE_TAIL_START = 8376320
+relocation__SAVE_TAIL_END = 8388608
+relocation__METADATA_OFFSET = 167424
+relocation__METADATA_SIZE = 4096
+relocation__METADATA_MAGIC = b"PCU\x568M01"
+relocation__PATCH_CAVE_START = 171520
+relocation__PATCH_CAVE_END = 176128
+relocation__TABLE_AREA_END = 262144
+relocation__ACQUIRED_RAM_BASE = 10144
+relocation__VISIBLE_RAM_BASE = 10176
+relocation__PROFILES = universal__PROFILES
+relocation__RomLayout = universal__RomLayout
+
+
+def relocation__align(v: int, a: int = 32) -> int:
+    return v + a - 1 & ~(a - 1)
+
+
+def relocation__activate(
+    profile: UniversalProfile, target_count: int, tl: Optional[dict[str, int]] = None
+) -> None:
+    if target_count < profile.stock_roster_count or target_count > relocation__PROJECT_ROSTER_COUNT:
+        raise ValueError(f"로스터 수 범위 오류: {target_count}")
+    tl = tl or relocation__table_layout(profile, target_count)
+    globals()["core__ROSTER_COUNT"] = target_count
+    globals()["core__MAX_ID"] = target_count - 1
+    globals()["core__ORIGINAL_ROSTER_COUNT"] = profile.stock_roster_count
+    globals()["core__ADDED_ROSTER_COUNT"] = target_count - profile.stock_roster_count
+    globals()["core__VANILLA_IMAGE_COUNT"] = profile.stock_image_count
+    globals()["core__FINAL_IMAGE_COUNT"] = tl["image_count"]
+    globals()["core__NO_RESULT_ID"] = target_count
+    globals()["core__ORIGINAL_SIZE_TABLE"] = profile.stock_size_table
+    globals()["core__RELOCATED_SIZE_TABLE"] = tl["size"]
+    globals()["core__ORIGINAL_STAT_TABLE"] = 131390
+    globals()["core__FINAL_STAT_TABLE"] = tl["stat"]
+    globals()["core__STAT_LOOKUP_SITE"] = profile.stat_lookup_site
+    globals()["core__CUTIN_FLAG"] = 171504
+    globals()["core__METADATA_OFFSET"] = relocation__METADATA_OFFSET
+    globals()["core__METADATA_SIZE"] = relocation__METADATA_SIZE
+    globals()["core__ALBUM_HOOK"] = profile.album_cursor_hook
+    globals()["core__ALBUM_RETURN"] = profile.album_cursor_return
+    globals()["core__EVO_HOOK"] = profile.evolution_hook
+    globals()["core__EVO_HOOK_RETURN"] = profile.evolution_return
+    globals()["core__EVO_RESULT_RETURN"] = profile.evolution_result_return
+    globals()["core__EVO_CAVE"] = tl["evo"]
+    globals()["core__EVO_CAVE_END"] = tl["evo_end"]
+    globals()["core__JOGRESS_STAGE_MISMATCH_SITE"] = profile.jogress_stage_mismatch_site
+    globals()["core__JOGRESS_POINTER_LOAD_SITE"] = profile.jogress_pointer_load_site
+    globals()["core__JOGRESS_POINTER_TABLE"] = tl["jog_ptr"]
+    globals()["core__JOGRESS_ROWS"] = tl["jog_rows"]
+    globals()["core__ROSTER_MAX_OFFSETS"] = list(profile.roster_max_offsets)
+    globals()["core__IMAGE_MAX_OFFSETS"] = list(profile.image_max_offsets)
+    globals()["core__SIZE_TABLE_ADDRESS_SITES"] = list(profile.size_table_sites)
+    globals()["core__EXPECTED_SHA256"] = profile.stock_sha256
+    globals()["core__DEFAULT_NEW_SLOT_TEMPLATE_ID"] = profile.stock_roster_count - 1
+
+
+def relocation__create_project_from_rom(path: Path):
+    data = path.read_bytes()
+    layout = relocation__identify_layout(data)
+    relocation__activate(layout.profile, relocation__PROJECT_ROSTER_COUNT)
+    images = relocation__read_images_flexible(data, layout.image_count, layout.size_table)
+    slots = []
+    current = min(layout.roster_count, relocation__PROJECT_ROSTER_COUNT)
+    for did in range(current):
+        stats = core__read_stat_words(data, did, layout.stat_table)
+        start = stats[0]
+        frames = [core__FrameRef("base", start + i) for i in range(12)]
+        name = (
+            core__DEFAULT_DISPLAY_NAMES[did]
+            if layout.profile.version == 1 and did < len(core__DEFAULT_DISPLAY_NAMES)            else f"VP{layout.profile.version} ID {did:03d}"
+        )
+        slots.append(core__DigimonSlot(did, name, stats, frames, core__EvolutionRoute()))
+    tid = max(0, current - 1)
+    ts = list(slots[tid].stats)
+    tf = copy.deepcopy(slots[tid].frames)
+    for did in range(current, relocation__PROJECT_ROSTER_COUNT):
+        st = list(ts)
+        st[core__ALBUM_ORDER_STAT_INDEX] = did
+        st[core__ALBUM_VISIBLE_STAT_INDEX] = 1
+        slots.append(
+            core__DigimonSlot(
+                did,
+                f"추가 슬롯 {did:03d}",
+                st,
+                copy.deepcopy(tf),
+                core__EvolutionRoute(False, 0, []),
+            )
+        )
+    pr = core__Project(
+        slots=slots,
+        rom_files={"vanilla": str(path.resolve()), "profile_version": str(layout.profile.version)},
+    )
+    return (pr, data, images, layout)
+
+
+def relocation__decode_image_address(rel: int) -> int:
+    return relocation__FLASH_BANK1 + rel & 4294967295
+
+
+def relocation__far_target(data: bytes | bytearray, off: int) -> Optional[int]:
+    a = core__read_u16(data, off)
+    b = core__read_u16(data, off + 2)
+    if a & 65534 != 65184:
+        return None
+    return ((a & 1) << 16 | b) * 2
+
+
+def relocation__identify_layout(data: bytes) -> relocation__RomLayout:
+    if len(data) not in (relocation__STOCK_ROM_SIZE, relocation__EXTENDED_ROM_SIZE):
+        raise ValueError("8 MiB 또는 16 MiB ROM만 지원합니다")
+    m = relocation__read_meta(data)
+    if m and m.get("format") in (
+        relocation__PROJECT_FORMAT,
+        "PenCUniversalProject\x567",
+        universal__PROJECT_FORMAT,
+    ):
+        p = relocation__PROFILES[int(m["profile_version"])]
+        return relocation__RomLayout(
+            p,
+            int(m["roster_count"]),
+            int(m["image_count"]),
+            int(m["stat_table"]),
+            int(m["size_table"]),
+            str(m.get("mode", "patched")),
+        )
+    if len(data) != relocation__STOCK_ROM_SIZE:
+        raise ValueError("메타데이터 없는 16 MiB ROM은 판별할 수 없습니다")
+    d = core__detect_penc_profile(data)
+    p = relocation__PROFILES[d.version]
+    return relocation__RomLayout(
+        p, p.stock_roster_count, p.stock_image_count, 131390, p.stock_size_table, "stock"
+    )
+
+
+def relocation__image_count_for(profile: UniversalProfile, count: int) -> int:
+    return (
+        profile.stock_image_count + (count - profile.stock_roster_count) * core__FRAMES_PER_DIGIMON
+    )
+
+
+def relocation__load_project(path: Path):
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if obj.get("format") != relocation__PROJECT_FORMAT:
+        if obj.get("format") in ("PenCUniversalProject\x567", universal__PROJECT_FORMAT):
+            version = int(obj["profile_version"])
+            base = Path(obj.get("base_rom", ""))
+            if not base.is_absolute():
+                base = (path.parent / base).resolve()
+            pr, data, imgs, layout = relocation__create_project_from_rom(base)
+            loaded = [core__DigimonSlot.from_dict(x) for x in obj.get("slots", [])]
+            for i, s in enumerate(loaded[:relocation__PROJECT_ROSTER_COUNT]):
+                pr.slots[i] = s
+            pr.project_path = path
+            return (pr, data, imgs, layout)
+        legacy = core__load_project(path)
+        base = Path(legacy.rom_files.get("vanilla", "PenC1.bin"))
+        if not base.is_absolute():
+            base = (path.parent / base).resolve()
+        pr, data, imgs, layout = relocation__create_project_from_rom(base)
+        for i, s in enumerate(legacy.slots[:relocation__PROJECT_ROSTER_COUNT]):
+            pr.slots[i] = s
+        pr.project_path = path
+        return (pr, data, imgs, layout)
+    version = int(obj["profile_version"])
+    base = Path(obj.get("base_rom", ""))
+    if not base.is_absolute():
+        base = (path.parent / base).resolve()
+    pr, data, imgs, layout = relocation__create_project_from_rom(base)
+    if layout.profile.version != version:
+        raise ValueError("프로젝트와 기반 ROM 버전이 다릅니다")
+    for i, s in enumerate(
+        [core__DigimonSlot.from_dict(x) for x in obj.get("slots", [])][
+            :relocation__PROJECT_ROSTER_COUNT
+        ]
+    ):
+        pr.slots[i] = s
+    pr.project_path = path
+    pr.rom_files = {"vanilla": str(base), "profile_version": str(version)}
+    return (pr, data, imgs, layout)
+
+
+def relocation__project_to_dict(project: core.Project, profile_version: int) -> dict[str, Any]:
+    return {
+        "format": relocation__PROJECT_FORMAT,
+        "app_version": relocation__APP_VERSION,
+        "profile_version": profile_version,
+        "base_rom": project.rom_files.get("vanilla", ""),
+        "slots": [
+            {
+                "id": s.digimon_id,
+                "name": s.name,
+                "stats": s.stats,
+                "frames": [asdict(f) for f in s.frames],
+                "evolution": {
+                    "enabled": s.evolution.enabled,
+                    "source_id": s.evolution.source_id,
+                    "conditions": [asdict(c) for c in s.evolution.conditions],
+                },
+            }
+            for s in project.slots
+        ],
+    }
+
+
+def relocation__read_images_flexible(
+    data: bytes, count: int, size_table: int
+) -> list[core__RomImage]:
+    if core__detect_image_count(data) != count:
+        raise ValueError(f"이미지 수 불일치: {core__detect_image_count(data)} != {count}")
+    out = []
+    for i in range(count):
+        rel = core__read_u32(data, relocation__FLASH_BANK1 + i * 4)
+        start = relocation__decode_image_address(rel)
+        w = core__read_u16(data, size_table + i * 4)
+        h = core__read_u16(data, size_table + i * 4 + 2)
+        end = start + w * h * 2
+        if not (1 <= w <= 256 and 1 <= h <= 256 and (0 <= start < end <= len(data))):
+            raise ValueError(f"이미지 {i} 범위/크기 오류: {start:#x} {w}x{h}")
+        if start < relocation__SAVE_TAIL_END and end > relocation__SAVE_TAIL_START:
+            raise ValueError(f"이미지 {i}가 저장영역을 침범합니다")
+        out.append(core__RomImage(w, h, data[start:end]))
+    return out
+
+
+def relocation__read_meta(data: bytes) -> Optional[dict[str, Any]]:
+    for magic in (relocation__METADATA_MAGIC, b"PCU\x567M01", universal__METADATA_MAGIC):
+        if data[relocation__METADATA_OFFSET : relocation__METADATA_OFFSET + len(magic)] == magic:
+            n = core__read_u32(data, relocation__METADATA_OFFSET + len(magic))
+            if 0 < n < relocation__METADATA_SIZE - len(magic) - 4:
+                try:
+                    return json.loads(
+                        data[
+                            relocation__METADATA_OFFSET
+                            + len(magic)
+                            + 4 : relocation__METADATA_OFFSET
+                            + len(magic)
+                            + 4
+                            + n
+                        ].decode("utf-8")
+                    )
+                except Exception:
+                    return None
+    return None
+
+
+def relocation__save_project(project: core.Project, profile_version: int, path: Path) -> None:
+    obj = relocation__project_to_dict(project, profile_version)
+    base = Path(obj["base_rom"])
+    if base.is_absolute():
+        try:
+            obj["base_rom"] = os.path.relpath(base, path.parent).replace("\\", "/")
+        except ValueError:
+            pass
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    project.project_path = path
+
+
+def relocation__table_layout(profile: UniversalProfile, target_count: int) -> dict[str, int]:
+    image_count = relocation__image_count_for(profile, target_count)
+    stat = 176128
+    jog_ptr = relocation__align(stat + target_count * core__STAT_RECORD_SIZE)
+    jog_rows = relocation__align(jog_ptr + target_count * 4)
+    size = relocation__align(jog_rows + target_count * 8)
+    evo = relocation__align(size + image_count * 4)
+    if evo >= relocation__TABLE_AREA_END:
+        raise ValueError(f"패치 테이블 영역 초과: evolution start {evo:#x}")
+    return {
+        "stat": stat,
+        "jog_ptr": jog_ptr,
+        "jog_rows": jog_rows,
+        "size": size,
+        "evo": evo,
+        "evo_end": relocation__TABLE_AREA_END,
+        "image_count": image_count,
+    }
+
+
+class relocation__Cave:
+
+    def __init__(self, out: bytearray):
+        self.out = out
+        self.cur = relocation__PATCH_CAVE_START
+
+    def put(self, words: list[int], align_words: int = 1) -> int:
+        self.cur = relocation__align(self.cur, align_words * 2)
+        start = self.cur
+        blob = struct.pack("<" + "H" * len(words), *words)
+        if start + len(blob) > relocation__PATCH_CAVE_END:
+            raise ValueError("트램펄린 cave 초과")
+        self.out[start : start + len(blob)] = blob
+        self.cur += len(blob)
+        return start
+
+
+def relocation__cmp16_word(reg: int) -> int:
+    return 4 << 12 | reg << 9 | 4 << 6 | 1 << 3 | reg
+
+
+def relocation__album_bit_test_target(source: bytes, profile: UniversalProfile) -> int:
+    meta = relocation__read_meta(source) or {}
+    if meta.get("album_bit_test_target") is not None:
+        return int(meta["album_bit_test_target"])
+    fn = relocation__original_album_function_bytes(source, profile)
+    if len(fn) != 82:
+        raise ValueError("원본 앨범 표시 함수 확보 실패")
+    w0, w1 = struct.unpack_from("<HH", fn, 68)
+    return relocation__call_target_from_words(w0, w1)
+
+
+def relocation__branch_positive(cond: int, dist: int) -> int:
+    return cond << 12 | 7 << 9 | dist & 63
+
+
+def relocation__branch_target(off: int, w: int) -> int:
+    dist = w & 63
+    neg = w >> 6 & 7 == 1
+    nxt = off + 2
+    return nxt - dist * 2 if neg else nxt + dist * 2
+
+
+def relocation__build_album_visibility_function(
+    profile: UniversalProfile, max_id: int, visible_base: int, bit_test_raw: int
+) -> list[int]:
+
+    stat_call = universal___call_words_for_raw(profile.stat_lookup_function)
+    bit_call = universal___call_words_for_raw(bit_test_raw)
+    w: list[int] = []
+    w += [55944, 8258, 2824, 1, 38976, 55296]
+    w += [8258, 38405, 2312, 1, 54980, 38478, 2312, 2, 54980, stat_call[0], stat_call[1], 66, 16960]
+    je_to_order_index = len(w)
+    w.append(0)
+    w += [38977, 55296]
+    jmp_epilogue_index = len(w)
+    w.append(0)
+    order_lookup_index = len(w)
+    w += [
+        8258,
+        38405,
+        2312,
+        1,
+        54980,
+        38477,
+        2312,
+        2,
+        54980,
+        stat_call[0],
+        stat_call[1],
+        66,
+        53761,
+        38913,
+        relocation__cmp16_word(4),
+        max_id,
+    ]
+    ja_epilogue_index = len(w)
+    w.append(0)
+    w += [
+        8259,
+        relocation__mov16_word(2),
+        visible_base,
+        38464,
+        2312,
+        1,
+        54484,
+        54980,
+        38401,
+        2312,
+        3,
+        54980,
+        bit_call[0],
+        bit_call[1],
+        67,
+        53760,
+    ]
+    epilogue_index = len(w)
+    w += [37376, 66, 39064]
+    w[je_to_order_index] = relocation__local_branch(5, order_lookup_index - (je_to_order_index + 1))
+    w[jmp_epilogue_index] = relocation__local_branch(14, epilogue_index - (jmp_epilogue_index + 1))
+    w[ja_epilogue_index] = relocation__local_branch(9, epilogue_index - (ja_epilogue_index + 1))
+    return w
+
+
+def relocation__build_evolution_wide(
+    slots: list[core.DigimonSlot], profile: UniversalProfile, tl: dict[str, int]
+) -> tuple[bytes, dict[str, Any]]:
+    words = []
+    reports = []
+    for slot in slots:
+        r = slot.evolution
+        if not r.enabled:
+            continue
+        start = len(words)
+        placeholders = []
+        words += [38912, relocation__cmp16_word(4), r.source_id]
+        placeholders.append((len(words), 78))
+        words.append(0)
+        real = [c for c in r.conditions if c.kind != 0]
+        for c in real:
+            c.validate()
+            words += [
+                65024,
+                39180,
+                core__CONDITION_STAT_ADDRESS[c.kind],
+                39140,
+                relocation__cmp16_word(4),
+                c.value,
+            ]
+            placeholders.append((len(words), core__OPERATOR_INVERSE_BRANCH_HIGH[c.operator]))
+            words.append(0)
+        words += [relocation__mov16_word(4), slot.digimon_id, 55296]
+        words += list(core__far_goto_words(profile.evolution_result_return))
+        end = len(words)
+        for idx, hi in placeholders:
+            dist = end - (idx + 1)
+            if dist > 255:
+                raise ValueError(f"ID {slot.digimon_id} 진화 경로가 너무 깁니다")
+            words[idx] = hi << 8 | dist
+        reports.append(
+            {"result_id": slot.digimon_id, "source_id": r.source_id, "conditions": len(real)}
+        )
+    words += [65024, 39180, 2086]
+    words += list(core__far_goto_words(profile.evolution_return))
+    blob = struct.pack("<" + "H" * len(words), *words)
+    cap = tl["evo_end"] - tl["evo"]
+    if len(blob) > cap:
+        raise ValueError(f"진화 코드 공간 초과 {len(blob)}/{cap}")
+    return (
+        blob,
+        {
+            "enabled_routes": len(reports),
+            "bytes_used": len(blob),
+            "bytes_capacity": cap,
+            "bytes_free": cap - len(blob),
+        },
+    )
+
+
+def relocation__build_rom(
+    project: core.Project, source: bytes, layout: RomLayout, target: int, extended: bool
+):
+    p = layout.profile
+    tl = relocation__table_layout(p, target)
+    relocation__activate(p, target, tl)
+    bp = core__Project(
+        slots=copy.deepcopy(project.slots[:target]), rom_files=dict(project.rom_files)
+    )
+    core__validate_project(bp)
+    srcimgs = relocation__read_images_flexible(source, layout.image_count, layout.size_table)
+    out = bytearray(
+        b"\xff" * (relocation__EXTENDED_ROM_SIZE if extended else relocation__STOCK_ROM_SIZE)
+    )
+    out[:relocation__STOCK_ROM_SIZE] = source[:relocation__STOCK_ROM_SIZE]
+    save = bytes(source[relocation__SAVE_TAIL_START:relocation__SAVE_TAIL_END])
+    out[relocation__METADATA_OFFSET:relocation__TABLE_AREA_END] = b"\x00" * (
+        relocation__TABLE_AREA_END - relocation__METADATA_OFFSET
+    )
+    final = list(srcimgs[: p.stock_image_count])
+    statslist = []
+    for s in bp.slots:
+        st = list(s.stats)
+        if s.digimon_id < p.stock_roster_count:
+            start = 240 + s.digimon_id * 12
+            st[0] = start
+            if s.digimon_id < layout.roster_count:
+                st[core__ALBUM_ORDER_STAT_INDEX] = core__read_stat_words(
+                    source, s.digimon_id, layout.stat_table
+                )[core__ALBUM_ORDER_STAT_INDEX]
+            for j, r in enumerate(s.frames):
+                final[start + j] = core__resolve_frame(r, srcimgs)
+        else:
+            start = p.stock_image_count + (s.digimon_id - p.stock_roster_count) * 12
+            st[0] = start
+            st[core__ALBUM_ORDER_STAT_INDEX] = s.digimon_id
+            final.extend((core__resolve_frame(r, srcimgs) for r in s.frames))
+        statslist.append(st)
+    if len(final) != tl["image_count"]:
+        raise AssertionError("image count")
+    img_report = relocation__write_images_relocated(out, final, extended)
+    for i, img in enumerate(final):
+        core__write_u16(out, tl["size"] + i * 4, img.width)
+        core__write_u16(out, tl["size"] + i * 4 + 2, img.height)
+    for s, st in zip(bp.slots, statslist):
+        core__write_stat_words(out, s.digimon_id, st, tl["stat"])
+    core__write_u16(out, p.stat_lookup_site, tl["stat"] // 2 & 65535)
+    relocation__patch_size_table_sites(out, p, tl["size"])
+    for off in p.image_max_offsets:
+        core__write_u16(out, off, tl["image_count"] - 1)
+    cave = relocation__Cave(out)
+    ram_report = relocation__patch_album_ram(out, source, target, cave)
+    for off in p.roster_max_offsets:
+        relocation__patch_wide_compare(out, off, target - 1, cave, source)
+    album_info = relocation__patch_album_visibility(out, source, p, target - 1, cave)
+    album_cursor = relocation__patch_album_cursor(out, p, target, cave)
+    evo, evo_report = relocation__build_evolution_wide(bp.slots, p, tl)
+    out[tl["evo"] : tl["evo_end"]] = b"\x00" * (tl["evo_end"] - tl["evo"])
+    out[tl["evo"] : tl["evo"] + len(evo)] = evo
+    core__write_far_goto(out, p.evolution_hook, tl["evo"])
+    relocation__patch_jogress(out, source, layout, target, tl, cave)
+    extra = {**ram_report, **album_info, "album_cursor": album_cursor}
+    relocation__write_meta(
+        out, p, target, tl, "extended16-relocated" if extended else "standard8-relocated", extra
+    )
+    if out[relocation__SAVE_TAIL_START:relocation__SAVE_TAIL_END] != save:
+        raise AssertionError("save tail changed")
+    report = {
+        "format": "PenC Universal Editor \x568 build report",
+        "app_version": relocation__APP_VERSION,
+        "profile": p.label,
+        "mode": "16MiB/266" if extended else "8MiB/114",
+        "rom_size": len(out),
+        "roster_count": target,
+        "max_id": target - 1,
+        "no_result_id": target,
+        "total_image_count": tl["image_count"],
+        "tables": tl,
+        "images": img_report,
+        "wide_limit_sites": len(p.roster_max_offsets),
+        "album_ram": ram_report,
+        "evolution": evo_report,
+        "save_tail_preserved": True,
+        "source_sha256": core__sha256(source),
+        "output_sha256": core__sha256(out),
+        "warning": "\x568 replaces the unstable wrapper/copy album path with one balanced function. ID>63 persistence and wrapped bank0 image pointers still require real-device validation.",
+    }
+    return (bytes(out), report)
+
+
+def relocation__call_target_from_words(w0: int, w1: int) -> int:
+    if w0 & 65472 not in (61504, 61536):
+        raise ValueError(f"far call opcode가 아닙니다: {w0:04X} {w1:04X}")
+    word_address = (w0 & 63) << 16 | w1
+    raw = (word_address - 2097152) * 2
+    if raw < 0:
+        raise ValueError(f"call target 범위 오류: {word_address:#x}")
+    return raw
+
+
+def relocation__clear_words_code(base: int, count: int, resume: int) -> list[int]:
+    words = [38464]
+    for a in range(base, base + count):
+        words += [65024, 39180, a, 55012]
+    words += list(core__far_goto_words(resume))
+    return words
+
+
+def relocation__find_clear(data: bytes, base: int) -> tuple[int, int]:
+    # Four native word stores occupy 11 words (22 bytes). A 24-byte resume
+    # skips the following instruction: the loop-counter reset for visibility,
+    # or SP -= 3 for acquisition. The latter corrupts a fresh-save call frame.
+    pat = struct.pack(
+        "<11H", 0x9440, 0x9640, 0xFE00, 0x990C, base, 0x9240, 0xD2F4, 0x9240, 0xD2F4, 0xD4F4, 0xD6E4
+    )
+    i = data.find(pat)
+    if i < 0:
+        raise ValueError(f"RAM {base:#x} clear sequence not found")
+    return (i, i + len(pat))
+
+
+def relocation__local_branch(cond: int, distance_words: int) -> int:
+    if not 0 <= distance_words <= 63:
+        raise ValueError(f"local branch 거리 초과: {distance_words}")
+    return cond << 12 | 7 << 9 | distance_words
+
+
+def relocation__mov16_word(reg: int) -> int:
+    return 9 << 12 | reg << 9 | 4 << 6 | 1 << 3 | reg
+
+
+def relocation__original_album_function_bytes(source: bytes, profile: UniversalProfile) -> bytes:
+    meta = relocation__read_meta(source) or {}
+    if meta.get("album_bit_test_target") is not None:
+        return b""
+    oldcopy = meta.get("album_original_copy")
+    if oldcopy is not None:
+        a = int(oldcopy)
+        return bytes(source[a : a + 82])
+    return bytes(source[profile.album_visibility_function : profile.album_visibility_function_end])
+
+
+def relocation__original_jog_rows(source: bytes, layout: RomLayout) -> list[list[int]]:
+    m = relocation__read_meta(source)
+    if m and m.get("jogress_rows") is not None:
+        base = int(m["jogress_rows"])
+        return [
+            [core__read_u16(source, base + i * 8 + j * 2) for j in range(4)]
+            for i in range(layout.profile.stock_roster_count)
+        ]
+    return core__read_original_jogress_rows(source)
+
+
+def relocation__patch_album_cursor(
+    out: bytearray, profile: UniversalProfile, count: int, cave: Cave
+) -> int:
+    g = core__far_goto_words(profile.album_cursor_return)
+    addr = cave.put([2113, relocation__cmp16_word(4), count, 19969, 38976, g[0], g[1]])
+    core__write_far_goto(out, profile.album_cursor_hook, addr)
+    return addr
+
+
+def relocation__patch_album_ram(
+    out: bytearray, source: bytes, target_count: int, cave: Cave
+) -> dict[str, Any]:
+    words = (target_count + 15) // 16
+    meta = relocation__read_meta(source) or {}
+    old_a = int(meta.get("acquired_ram_base", 2127))
+    old_v = int(meta.get("visible_ram_base", 2131))
+    repl_a = repl_v = 0
+    for off in range(0, 139264, 2):
+        w = core__read_u16(out, off)
+        if w == old_a:
+            core__write_u16(out, off, relocation__ACQUIRED_RAM_BASE)
+            repl_a += 1
+        elif w == old_v:
+            core__write_u16(out, off, relocation__VISIBLE_RAM_BASE)
+            repl_v += 1
+    if meta.get("acquired_clear_start") is not None:
+        acs = int(meta["acquired_clear_start"])
+        ac_resume = int(meta["acquired_clear_resume"])
+        vcs = int(meta["visible_clear_start"])
+        vc_resume = int(meta["visible_clear_resume"])
+    else:
+        acs, ac_resume = relocation__find_clear(source, 2127)
+        vcs, vc_resume = relocation__find_clear(source, 2131)
+    ac_tr = cave.put(relocation__clear_words_code(relocation__ACQUIRED_RAM_BASE, words, ac_resume))
+    core__write_far_goto(out, acs, ac_tr)
+    vc_tr = cave.put(relocation__clear_words_code(relocation__VISIBLE_RAM_BASE, words, vc_resume))
+    core__write_far_goto(out, vcs, vc_tr)
+    return {
+        "word_count": words,
+        "acquired_clear_start": acs,
+        "acquired_clear_resume": ac_resume,
+        "visible_clear_start": vcs,
+        "visible_clear_resume": vc_resume,
+        "refs_acquired": repl_a,
+        "refs_visible": repl_v,
+    }
+
+
+def relocation__patch_album_visibility(
+    out: bytearray, source: bytes, profile: UniversalProfile, max_id: int, cave: Cave
+) -> dict[str, int]:
+    bit_target = relocation__album_bit_test_target(source, profile)
+    words = relocation__build_album_visibility_function(
+        profile, max_id, relocation__VISIBLE_RAM_BASE, bit_target
+    )
+    impl = cave.put(words)
+    core__write_far_goto(out, profile.album_visibility_function, impl)
+    return {
+        "album_visibility_impl": impl,
+        "album_bit_test_target": bit_target,
+        "album_visibility_words": len(words),
+    }
+
+
+def relocation__patch_jogress(
+    out: bytearray, source: bytes, layout: RomLayout, count: int, tl: dict[str, int], cave: Cave
+) -> None:
+    rows = relocation__original_jog_rows(source, layout)
+    core__write_u16(out, layout.profile.jogress_pointer_load_site, tl["jog_ptr"] // 2 & 65535)
+    relocation__patch_wide_sentinel_load(
+        out, layout.profile.jogress_stage_mismatch_site, count, cave, source
+    )
+    for sid in range(count):
+        ro = tl["jog_rows"] + sid * 8
+        core__write_u32(out, tl["jog_ptr"] + sid * 4, 2097152 + ro // 2)
+        vals = (
+            [count if x in (layout.profile.stock_roster_count, 65535) else x for x in rows[sid]]
+            if sid < layout.profile.stock_roster_count
+            else [count] * 4
+        )
+        for j, v in enumerate(vals):
+            core__write_u16(out, ro + j * 2, v)
+
+
+def relocation__patch_size_table_sites(
+    out: bytearray, profile: UniversalProfile, address: int
+) -> None:
+    wa = address // 2
+    low = wa & 65535
+    high = wa >> 16 & 1
+    for off in profile.size_table_sites:
+        core__write_u16(out, off, low)
+        core__write_u16(out, off + 2, 39008 | high)
+
+
+def relocation__patch_wide_compare(
+    out: bytearray, off: int, value: int, cave: Cave, reference: Optional[bytes] = None
+) -> None:
+    ref = reference if reference is not None else out
+    existing = relocation__far_target(ref, off)
+    if (
+        existing is not None
+        and relocation__PATCH_CAVE_START <= existing < relocation__PATCH_CAVE_END
+    ):
+        words = list(struct.unpack_from("<7H", ref, existing))
+        words[1] = value
+        tramp = cave.put(words)
+        core__write_far_goto(out, off, tramp)
+        return
+    cmpw = core__read_u16(ref, off)
+    br = core__read_u16(ref, off + 2)
+    if cmpw >> 12 != 4 or cmpw >> 6 & 7 != 1 or br >> 9 & 7 != 7:
+        raise ValueError(f"상한 비교 패턴 불일치 @{off:#x}: {cmpw:04X} {br:04X}")
+    reg = cmpw >> 9 & 7
+    cond = br >> 12 & 15
+    target = relocation__branch_target(off + 2, br)
+    fall = off + 4
+    gf = core__far_goto_words(fall)
+    gt = core__far_goto_words(target)
+    tramp = cave.put(
+        [
+            relocation__cmp16_word(reg),
+            value,
+            relocation__branch_positive(cond, 2),
+            gf[0],
+            gf[1],
+            gt[0],
+            gt[1],
+        ]
+    )
+    core__write_far_goto(out, off, tramp)
+
+
+def relocation__patch_wide_sentinel_load(
+    out: bytearray, site: int, value: int, cave: Cave, reference: Optional[bytes] = None
+) -> None:
+    ref = reference if reference is not None else out
+    existing = relocation__far_target(ref, site)
+    if (
+        existing is not None
+        and relocation__PATCH_CAVE_START <= existing < relocation__PATCH_CAVE_END
+    ):
+        words = list(struct.unpack_from("<5H", ref, existing))
+        words[1] = value
+        tramp = cave.put(words)
+        core__write_far_goto(out, site, tramp)
+        return
+    w = core__read_u16(ref, site)
+    reg = w >> 9 & 7
+    cleanup = core__read_u16(ref, site + 2)
+    ret = site + 4
+    g = core__far_goto_words(ret)
+    tramp = cave.put([relocation__mov16_word(reg), value, cleanup, g[0], g[1]])
+    core__write_far_goto(out, site, tramp)
+
+
+def relocation__write_images_relocated(
+    data: bytearray, images: list[core.RomImage], extended: bool
+) -> dict[str, Any]:
+    count = len(images)
+    regions = [
+        ["bank1", relocation__FLASH_BANK1 + count * 4, relocation__SAVE_TAIL_START],
+        ["bank0", relocation__BANK0_IMAGE_START, relocation__FLASH_BANK1],
+    ]
+    if extended:
+        regions.append(["uppe\x7216", relocation__SAVE_TAIL_END, len(data)])
+    data[relocation__FLASH_BANK1:relocation__SAVE_TAIL_START] = b"\x00" * (
+        relocation__SAVE_TAIL_START - relocation__FLASH_BANK1
+    )
+    data[relocation__BANK0_IMAGE_START:relocation__FLASH_BANK1] = b"\x00" * (
+        relocation__FLASH_BANK1 - relocation__BANK0_IMAGE_START
+    )
+    if extended:
+        data[relocation__SAVE_TAIL_END:] = b"\xff" * (len(data) - relocation__SAVE_TAIL_END)
+    ri = 0
+    cur = regions[0][1]
+    used = {r[0]: 0 for r in regions}
+    first = {}
+    for i, img in enumerate(images):
+        sz = len(img.pixels)
+        if cur + sz > regions[ri][2]:
+            ri += 1
+            if ri >= len(regions):
+                raise ValueError(f"이미지 공간 초과: image {i}")
+            cur = regions[ri][1]
+        end = cur + sz
+        addr = cur
+        rel = addr - relocation__FLASH_BANK1 & 4294967295
+        core__write_u32(data, relocation__FLASH_BANK1 + i * 4, rel)
+        data[addr:end] = img.pixels
+        used[regions[ri][0]] += sz
+        first.setdefault(regions[ri][0], addr)
+        cur = end
+    return {"last_end": cur, "region_used": used, "region_first": first}
+
+
+def relocation__write_meta(
+    out: bytearray,
+    profile: UniversalProfile,
+    count: int,
+    tl: dict[str, int],
+    mode: str,
+    extra: dict[str, Any],
+) -> None:
+    payload = {
+        "format": relocation__PROJECT_FORMAT,
+        "app_version": relocation__APP_VERSION,
+        "profile_version": profile.version,
+        "roster_count": count,
+        "image_count": tl["image_count"],
+        "stat_table": tl["stat"],
+        "size_table": tl["size"],
+        "jogress_pointer_table": tl["jog_ptr"],
+        "jogress_rows": tl["jog_rows"],
+        "evolution_cave": tl["evo"],
+        "mode": mode,
+        "acquired_ram_base": relocation__ACQUIRED_RAM_BASE,
+        "visible_ram_base": relocation__VISIBLE_RAM_BASE,
+        **extra,
+    }
+    b = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(b) + 12 > relocation__METADATA_SIZE:
+        raise ValueError("메타데이터 공간 초과")
+    out[relocation__METADATA_OFFSET : relocation__METADATA_OFFSET + relocation__METADATA_SIZE] = (
+        b"\x00" * relocation__METADATA_SIZE
+    )
+    out[relocation__METADATA_OFFSET : relocation__METADATA_OFFSET + 8] = relocation__METADATA_MAGIC
+    core__write_u32(out, relocation__METADATA_OFFSET + 8, len(b))
+    out[relocation__METADATA_OFFSET + 12 : relocation__METADATA_OFFSET + 12 + len(b)] = b
+
+
+globals()["universal__APP_VERSION"] = relocation__APP_VERSION
+globals()["universal__PROJECT_FORMAT"] = relocation__PROJECT_FORMAT
+globals()["universal__PROJECT_ROSTER_COUNT"] = relocation__PROJECT_ROSTER_COUNT
+globals()["universal__STANDARD_ROSTER_COUNT"] = relocation__STANDARD_ROSTER_COUNT
+globals()["universal__EXTENDED_ROSTER_COUNT"] = relocation__EXTENDED_ROSTER_COUNT
+globals()["universal__activate"] = relocation__activate
+globals()["universal__identify_layout"] = relocation__identify_layout
+globals()["universal__read_images_flexible"] = relocation__read_images_flexible
+globals()["universal__create_project_from_rom"] = relocation__create_project_from_rom
+globals()["universal__save_universal_project"] = relocation__save_project
+globals()["universal__load_universal_project"] = relocation__load_project
+globals()["universal__build_universal_rom"] = relocation__build_rom
+
+
+class relocation__GUI(universal__UniversalEditorGUI):
+
+    def _retitle_roster_label(self):
+
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    t = c.cget("text")
+                    if str(t).startswith("로스터 ID"):
+                        c.configure(text="로스터 ID 000–265 (000–113: 8MB, 114–265: 16MB)")
+                except Exception:
+                    pass
+                walk(c)
+
+        walk(self.root)
+
+    def _build_menu(self):
+        from tkinter import Menu
+
+        m = Menu(self.root)
+        f = Menu(m, tearoff=False)
+        f.add_command(label="PenC0~PenC5 ROM 열기...", command=self.open_rom_dialog)
+        f.add_command(label="프로젝트 열기...", command=self.open_project_dialog)
+        f.add_command(label="프로젝트 저장", command=self.save_project_action)
+        f.add_command(
+            label="프로젝트 다른 이름으로 저장...", command=lambda: self.save_project_action(True)
+        )
+        f.add_separator()
+        f.add_command(
+            label="최대 표준 ROM 저장 (8 MiB / 114마리)...",
+            command=lambda: self.build_rom_mode(False),
+        )
+        f.add_command(
+            label="최대 확장 ROM 저장 (16 MiB / 266마리)...",
+            command=lambda: self.build_rom_mode(True),
+        )
+        f.add_separator()
+        f.add_command(label="종료", command=self.root.destroy)
+        m.add_cascade(label="파일", menu=f)
+        t = Menu(m, tearoff=False)
+        t.add_command(label="기반 ROM 다시 선택...", command=self.reload_references)
+        t.add_command(label="프로젝트 검증", command=self.validate_action)
+        m.add_cascade(label="도구", menu=t)
+        self.root.config(menu=m)
+
+    def update_capacity(self):
+        if self.project is None or self.profile is None:
+            return
+        try:
+            a = relocation__table_layout(self.profile, relocation__STANDARD_ROSTER_COUNT)
+            b = relocation__table_layout(self.profile, relocation__EXTENDED_ROSTER_COUNT)
+            self.capacity_var.set(
+                f"8MB 최대 {relocation__STANDARD_ROSTER_COUNT}마리/{a['image_count']} images | 16MB 최대 {relocation__EXTENDED_ROSTER_COUNT}마리/{b['image_count']} images"
+            )
+        except Exception as e:
+            self.capacity_var.set(str(e))
+
+
+import argparse
+import copy
+import json
+import os
+import struct
+import sys
+import traceback
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Optional
+
+album_base__APP_VERSION = "4.1.0"
+album_base__PROJECT_FORMAT = "PenCUniversalProject\x5610"
+album_base__PROJECT_ROSTER_COUNT = 266
+album_base__STANDARD_ROSTER_COUNT = 114
+album_base__EXTENDED_ROSTER_COUNT = 266
+album_base__STOCK_ROM_SIZE = relocation__STOCK_ROM_SIZE
+album_base__EXTENDED_ROM_SIZE = relocation__EXTENDED_ROM_SIZE
+album_base__FLASH_BANK1 = relocation__FLASH_BANK1
+album_base__SAVE_TAIL_START = relocation__SAVE_TAIL_START
+album_base__SAVE_TAIL_END = relocation__SAVE_TAIL_END
+album_base__METADATA_OFFSET = relocation__METADATA_OFFSET
+album_base__METADATA_SIZE = relocation__METADATA_SIZE
+album_base__METADATA_MAGIC = b"PCU\x5610M1"
+album_base__ACQUIRED_RAM_BASE = relocation__ACQUIRED_RAM_BASE
+album_base__VISIBLE_RAM_BASE = relocation__VISIBLE_RAM_BASE
+album_base__ALBUM_NUMBER_SITES = {
+    0: (22718, 22858, 104572),
+    1: (22352, 22492, 102624),
+    2: (22268, 22408, 102558),
+    3: (22292, 22432, 102564),
+    4: (22602, 22742, 104126),
+    5: (22620, 22760, 104138),
+}
+album_base__PROFILES = relocation__PROFILES
+album_base__RomLayout = relocation__RomLayout
+
+
+def album_base__activate(
+    profile: UniversalProfile, target_count: int, tl: Optional[dict[str, int]] = None
+) -> None:
+    relocation__activate(profile, target_count, tl)
+
+
+def album_base__read_meta(data: bytes) -> Optional[dict[str, Any]]:
+    for magic in (
+        album_base__METADATA_MAGIC,
+        b"PCU\x569M01",
+        relocation__METADATA_MAGIC,
+        b"PCU\x567M01",
+        universal__METADATA_MAGIC,
+    ):
+        if data[album_base__METADATA_OFFSET : album_base__METADATA_OFFSET + len(magic)] == magic:
+            n = core__read_u32(data, album_base__METADATA_OFFSET + len(magic))
+            if 0 < n < album_base__METADATA_SIZE - len(magic) - 4:
+                try:
+                    return json.loads(
+                        data[
+                            album_base__METADATA_OFFSET
+                            + len(magic)
+                            + 4 : album_base__METADATA_OFFSET
+                            + len(magic)
+                            + 4
+                            + n
+                        ].decode("utf-8")
+                    )
+                except Exception:
+                    return None
+    return None
+
+
+def album_base__table_layout(profile: UniversalProfile, target_count: int) -> dict[str, int]:
+    return relocation__table_layout(profile, target_count)
+
+
+globals()["relocation__read_meta"] = album_base__read_meta
+
+
+def album_base__identify_layout(data: bytes) -> album_base__RomLayout:
+    if len(data) not in (album_base__STOCK_ROM_SIZE, album_base__EXTENDED_ROM_SIZE):
+        raise ValueError("8 MiB 또는 16 MiB ROM만 지원합니다")
+    m = album_base__read_meta(data)
+    if m and m.get("format") in (
+        album_base__PROJECT_FORMAT,
+        "PenCUniversalProject\x569",
+        relocation__PROJECT_FORMAT,
+        "PenCUniversalProject\x567",
+        universal__PROJECT_FORMAT,
+    ):
+        p = album_base__PROFILES[int(m["profile_version"])]
+        return album_base__RomLayout(
+            p,
+            int(m["roster_count"]),
+            int(m["image_count"]),
+            int(m["stat_table"]),
+            int(m["size_table"]),
+            str(m.get("mode", "patched")),
+        )
+    return relocation__identify_layout(data)
+
+
+def album_base___divide_current_r4(divisor: int, quotient: bool) -> list[int]:
+    if divisor <= 63:
+        w = [38464 | divisor]
+    else:
+        w = [38667, divisor]
+    w += [54920, 55432]
+    w += list(universal___call_words_for_raw(49932 if quotient else 49746))
+    w += [66]
+    return w
+
+
+def album_base___load_album_number() -> list[int]:
+    return [65024, 39180, 2154, 39140, 2113]
+
+
+def album_base___set_draw_args(
+    layer: int, image_reg_is_r1: bool, x: int, draw_raw: int
+) -> list[int]:
+
+    w: list[int] = [38667, layer, 2312, 1, 54980]
+    if image_reg_is_r1:
+        w += [1801, 147]
+    else:
+        raise ValueError("현재 구현은 r1 digit만 지원합니다")
+    w += [2312, 2, 54980, 38667, x, 2312, 3, 54980, 38512, 2312, 4, 54980, 38465, 2312, 5, 54980]
+    w += list(universal___call_words_for_raw(draw_raw))
+    return w
+
+
+def album_base__build_album_number_3digit(draw_raw: int, return_raw: int) -> list[int]:
+
+    w: list[int] = []
+    w += album_base___load_album_number()
+    w += album_base___divide_current_r4(100, True)
+    w += album_base___set_draw_args(11, True, 52, draw_raw)
+    w += album_base___load_album_number()
+    w += album_base___divide_current_r4(10, True)
+    w += [53760]
+    w += [38912]
+    w += album_base___divide_current_r4(10, False)
+    w += album_base___set_draw_args(12, True, 68, draw_raw)
+    w += album_base___load_album_number()
+    w += album_base___divide_current_r4(10, False)
+    w += album_base___set_draw_args(13, True, 84, draw_raw)
+    w += list(core__far_goto_words(return_raw))
+    return w
+
+
+def album_base__build_rom(
+    project: core.Project, source: bytes, layout: RomLayout, target: int, extended: bool
+):
+    expected = album_base__EXTENDED_ROSTER_COUNT if extended else album_base__STANDARD_ROSTER_COUNT
+    if target != expected:
+        raise ValueError(f"\x5610 {('16MB' if extended else '8MB')} 저장 수는 {expected}마리입니다")
+    p = layout.profile
+    tl = album_base__table_layout(p, target)
+    album_base__activate(p, target, tl)
+    bp = core__Project(
+        slots=copy.deepcopy(project.slots[:target]), rom_files=dict(project.rom_files)
+    )
+    core__validate_project(bp)
+    srcimgs = album_base__read_images_flexible(source, layout.image_count, layout.size_table)
+    out = bytearray(
+        b"\xff" * (album_base__EXTENDED_ROM_SIZE if extended else album_base__STOCK_ROM_SIZE)
+    )
+    out[:album_base__STOCK_ROM_SIZE] = source[:album_base__STOCK_ROM_SIZE]
+    save = bytes(source[album_base__SAVE_TAIL_START:album_base__SAVE_TAIL_END])
+    out[album_base__METADATA_OFFSET:relocation__TABLE_AREA_END] = b"\x00" * (
+        relocation__TABLE_AREA_END - album_base__METADATA_OFFSET
+    )
+    final = list(srcimgs[: p.stock_image_count])
+    statslist: list[list[int]] = []
+    for s in bp.slots:
+        st = list(s.stats)
+        if s.digimon_id < p.stock_roster_count:
+            start = 240 + s.digimon_id * 12            st[0] = start
+            if s.digimon_id < layout.roster_count:
+                st[core__ALBUM_ORDER_STAT_INDEX] = core__read_stat_words(
+                    source, s.digimon_id, layout.stat_table
+                )[core__ALBUM_ORDER_STAT_INDEX]
+            for j, ref in enumerate(s.frames):
+                final[start + j] = core__resolve_frame(ref, srcimgs)
+        else:
+            start = p.stock_image_count + (s.digimon_id - p.stock_roster_count) * 12
+            st[0] = start
+            st[core__ALBUM_ORDER_STAT_INDEX] = s.digimon_id
+            final.extend((core__resolve_frame(ref, srcimgs) for ref in s.frames))
+        statslist.append(st)
+    if len(final) != tl["image_count"]:
+        raise AssertionError("image count")
+    img_report = album_base__write_images_safe(out, final, extended)
+    for i, img in enumerate(final):
+        core__write_u16(out, tl["size"] + i * 4, img.width)
+        core__write_u16(out, tl["size"] + i * 4 + 2, img.height)
+    for s, st in zip(bp.slots, statslist):
+        core__write_stat_words(out, s.digimon_id, st, tl["stat"])
+    core__write_u16(out, p.stat_lookup_site, tl["stat"] // 2 & 65535)
+    relocation__patch_size_table_sites(out, p, tl["size"])
+    for off in p.image_max_offsets:
+        core__write_u16(out, off, tl["image_count"] - 1)
+    cave = relocation__Cave(out)
+    ram_report = album_base__patch_album_ram_safe(out, source, target, cave)
+    for off in p.roster_max_offsets:
+        relocation__patch_wide_compare(out, off, target - 1, cave, source)
+    album_info = relocation__patch_album_visibility(out, source, p, target - 1, cave)
+    album_cursor = relocation__patch_album_cursor(out, p, target, cave)
+    number_info = album_base__patch_album_number(out, p, cave)
+    evo, evo_report = relocation__build_evolution_wide(bp.slots, p, tl)
+    out[tl["evo"] : tl["evo_end"]] = b"\x00" * (tl["evo_end"] - tl["evo"])
+    out[tl["evo"] : tl["evo"] + len(evo)] = evo
+    core__write_far_goto(out, p.evolution_hook, tl["evo"])
+    relocation__patch_jogress(out, source, layout, target, tl, cave)
+    extra = {
+        **ram_report,
+        **album_info,
+        **number_info,
+        "album_cursor": album_cursor,
+        "image_pointer_policy": "nonnegative-relative-only",
+    }
+    album_base__write_meta(
+        out,
+        p,
+        target,
+        tl,
+        "extended16-safe-positive" if extended else "standard8-safe-bank1",
+        extra,
+    )
+    if out[album_base__SAVE_TAIL_START:album_base__SAVE_TAIL_END] != save:
+        raise AssertionError("save tail changed")
+    decoded = []
+    for i in range(tl["image_count"]):
+        rel = core__read_u32(out, album_base__FLASH_BANK1 + i * 4)
+        addr = album_base__FLASH_BANK1 + rel
+        decoded.append(addr)
+        if addr < album_base__FLASH_BANK1:
+            raise AssertionError(f"negative/wrapped image pointer at {i}: {addr:#x}")
+        if album_base__SAVE_TAIL_START <= addr < album_base__SAVE_TAIL_END:
+            raise AssertionError(f"save-tail image pointer at {i}: {addr:#x}")
+        if addr >= len(out):
+            raise AssertionError(f"out-of-ROM image pointer at {i}: {addr:#x}")
+    report = {
+        "format": "PenC Universal Editor \x5610 build report",
+        "app_version": album_base__APP_VERSION,
+        "profile": p.label,
+        "mode": f"{('16MiB' if extended else '8MiB')}/{target}",
+        "rom_size": len(out),
+        "roster_count": target,
+        "max_id": target - 1,
+        "no_result_id": target,
+        "total_image_count": tl["image_count"],
+        "tables": tl,
+        "images": img_report,
+        "album_number": number_info,
+        "album_number_format": "fixed 3-digit decimal on layers 11-13",
+        "wide_limit_sites": len(p.roster_max_offsets),
+        "album_ram": ram_report,
+        "evolution": evo_report,
+        "save_tail_preserved": True,
+        "minimum_image_address": min(decoded),
+        "maximum_image_address": max(decoded),
+        "source_sha256": core__sha256(source),
+        "output_sha256": core__sha256(out),
+        "hist_dc_hardware_findings": {
+            "F0_F9": "100-109 rendered through non-digit glyphs by the stock two-digit routine",
+            "o0_o4": "110-114 rendered through non-digit glyphs by the stock two-digit routine",
+            "corrupted_last_sprite": "wrapped bank0 relative image pointer rejected by hardware",
+            "album_entry_reset": "\x569 used invalid display layer 14; \x5610 reuses transparent stock layer 11",
+            "sleep_no_wake": "\x567-\x569 blindly rewrote two r4 += 15 operands; \x5610 repairs and semantically filters RAM references",
+        },
+        "warning": "8MiB \x5610 intentionally returns to the proven bank1-only sprite layout. 16MiB positive offsets above 0x800000 still require MX25L12833F real-hardware testing.",
+    }
+    return (bytes(out), report)
+
+
+def album_base__create_project_from_rom(path: Path):
+    data = path.read_bytes()
+    layout = album_base__identify_layout(data)
+    album_base__activate(layout.profile, album_base__PROJECT_ROSTER_COUNT)
+    images = album_base__read_images_flexible(data, layout.image_count, layout.size_table)
+    slots: list[core__DigimonSlot] = []
+    current = min(layout.roster_count, album_base__PROJECT_ROSTER_COUNT)
+    for did in range(current):
+        stats = core__read_stat_words(data, did, layout.stat_table)
+        start = stats[0]
+        frames = [core__FrameRef("base", start + i) for i in range(12)]
+        name = (
+            core__DEFAULT_DISPLAY_NAMES[did]
+            if layout.profile.version == 1 and did < len(core__DEFAULT_DISPLAY_NAMES)
+            else f"VP{layout.profile.version} ID {did:03d}"
+        )
+        slots.append(core__DigimonSlot(did, name, stats, frames, core__EvolutionRoute()))
+    tid = max(0, current - 1)
+    ts = list(slots[tid].stats)
+    tf = copy.deepcopy(slots[tid].frames)
+    for did in range(current, album_base__PROJECT_ROSTER_COUNT):
+        st = list(ts)
+        st[core__ALBUM_ORDER_STAT_INDEX] = did
+        st[core__ALBUM_VISIBLE_STAT_INDEX] = 1
+        slots.append(
+            core__DigimonSlot(
+                did,
+                f"추가 슬롯 {did:03d}",
+                st,
+                copy.deepcopy(tf),
+                core__EvolutionRoute(False, 0, []),
+            )
+        )
+    pr = core__Project(
+        slots=slots,
+        rom_files={"vanilla": str(path.resolve()), "profile_version": str(layout.profile.version)},
+    )
+    return (pr, data, images, layout)
+
+
+def album_base__load_project(path: Path):
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if obj.get("format") == album_base__PROJECT_FORMAT:
+        version = int(obj["profile_version"])
+        base = Path(obj.get("base_rom", ""))
+        if not base.is_absolute():
+            base = (path.parent / base).resolve()
+        pr, data, imgs, layout = album_base__create_project_from_rom(base)
+        if layout.profile.version != version:
+            raise ValueError("프로젝트와 기반 ROM 버전이 다릅니다")
+        loaded = [core__DigimonSlot.from_dict(x) for x in obj.get("slots", [])]
+        for i, slot in enumerate(loaded[:album_base__PROJECT_ROSTER_COUNT]):
+            pr.slots[i] = slot
+        pr.project_path = path
+        pr.rom_files = {"vanilla": str(base), "profile_version": str(version)}
+        return (pr, data, imgs, layout)
+    if obj.get("format") in (
+        "PenCUniversalProject\x569",
+        relocation__PROJECT_FORMAT,
+        "PenCUniversalProject\x567",
+        universal__PROJECT_FORMAT,
+    ):
+        version = int(obj["profile_version"])
+        base = Path(obj.get("base_rom", ""))
+        if not base.is_absolute():
+            base = (path.parent / base).resolve()
+        pr, data, imgs, layout = album_base__create_project_from_rom(base)
+        loaded = [core__DigimonSlot.from_dict(x) for x in obj.get("slots", [])]
+        for i, slot in enumerate(loaded[:album_base__PROJECT_ROSTER_COUNT]):
+            pr.slots[i] = slot
+        pr.project_path = path
+        return (pr, data, imgs, layout)
+    legacy = core__load_project(path)
+    base = Path(legacy.rom_files.get("vanilla", "PenC1.bin"))
+    if not base.is_absolute():
+        base = (path.parent / base).resolve()
+    pr, data, imgs, layout = album_base__create_project_from_rom(base)
+    for i, slot in enumerate(legacy.slots[:album_base__PROJECT_ROSTER_COUNT]):
+        pr.slots[i] = slot
+    pr.project_path = path
+    return (pr, data, imgs, layout)
+
+
+def album_base__patch_album_number(
+    out: bytearray, profile: UniversalProfile, cave: hist_dc.Cave
+) -> dict[str, int]:
+    hook_raw, return_raw, draw_raw = album_base__ALBUM_NUMBER_SITES[profile.version]
+    words = album_base__build_album_number_3digit(draw_raw, return_raw)
+    impl = cave.put(words)
+    core__write_far_goto(out, hook_raw, impl)
+    return {
+        "album_number_impl": impl,
+        "album_number_words": len(words),
+        "digits": 3,
+        "hook": hook_raw,
+        "return": return_raw,
+        "draw_function": draw_raw,
+    }
+
+
+def album_base__project_to_dict(project: core.Project, profile_version: int) -> dict[str, Any]:
+    return {
+        "format": album_base__PROJECT_FORMAT,
+        "app_version": album_base__APP_VERSION,
+        "profile_version": profile_version,
+        "base_rom": project.rom_files.get("vanilla", ""),
+        "slots": [
+            {
+                "id": s.digimon_id,
+                "name": s.name,
+                "stats": s.stats,
+                "frames": [asdict(f) for f in s.frames],
+                "evolution": {
+                    "enabled": s.evolution.enabled,
+                    "source_id": s.evolution.source_id,
+                    "conditions": [asdict(c) for c in s.evolution.conditions],
+                },
+            }
+            for s in project.slots
+        ],
+    }
+
+
+def album_base__read_images_flexible(
+    data: bytes, count: int, size_table: int
+) -> list[core__RomImage]:
+    return relocation__read_images_flexible(data, count, size_table)
+
+
+def album_base__save_project(project: core.Project, profile_version: int, path: Path) -> None:
+    obj = album_base__project_to_dict(project, profile_version)
+    base = Path(obj["base_rom"])
+    if base.is_absolute():
+        try:
+            obj["base_rom"] = os.path.relpath(base, path.parent).replace("\\", "/")
+        except ValueError:
+            pass
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    project.project_path = path
+
+
+def album_base__write_images_safe(
+    data: bytearray, images: list[core.RomImage], extended: bool
+) -> dict[str, Any]:
+
+    count = len(images)
+    regions: list[list[Any]] = [
+        ["bank1", album_base__FLASH_BANK1 + count * 4, album_base__SAVE_TAIL_START]
+    ]
+    if extended:
+        regions.append(["uppe\x7216", album_base__SAVE_TAIL_END, len(data)])
+    data[album_base__FLASH_BANK1:album_base__SAVE_TAIL_START] = b"\x00" * (
+        album_base__SAVE_TAIL_START - album_base__FLASH_BANK1
+    )
+    if extended:
+        data[album_base__SAVE_TAIL_END:] = b"\xff" * (len(data) - album_base__SAVE_TAIL_END)
+    ri = 0
+    cur = regions[0][1]
+    used = {r[0]: 0 for r in regions}
+    first: dict[str, int] = {}
+    seen: dict[tuple[int, int, bytes], int] = {}
+    duplicate_images = 0
+    duplicate_bytes_saved = 0
+    unique_images = 0
+    for i, img in enumerate(images):
+        size = len(img.pixels)
+        key = (img.width, img.height, img.pixels)
+        addr = seen.get(key)
+        if addr is not None:
+            duplicate_images += 1
+            duplicate_bytes_saved += size
+            core__write_u32(data, album_base__FLASH_BANK1 + i * 4, addr - album_base__FLASH_BANK1)
+            continue
+        if cur + size > regions[ri][2]:
+            ri += 1
+            if ri >= len(regions):
+                available = sum((int(r[2]) - int(r[1]) for r in regions))
+                used_total = sum(used.values())
+                raise ValueError(
+                    f"고유 이미지 공간 초과: image {i}, 사용 {used_total:,} / {available:,} bytes. 동일 프레임은 자동 공유되지만 현재 프로젝트의 서로 다른 픽셀이 칩 용량을 넘었습니다."
+                )
+            cur = regions[ri][1]
+        addr = cur
+        end = addr + size
+        rel = addr - album_base__FLASH_BANK1
+        if rel < 0:
+            raise AssertionError("\x5610은 음수 이미지 포인터를 만들지 않습니다")
+        core__write_u32(data, album_base__FLASH_BANK1 + i * 4, rel)
+        data[addr:end] = img.pixels
+        seen[key] = addr
+        unique_images += 1
+        used[regions[ri][0]] += size
+        first.setdefault(regions[ri][0], addr)
+        cur = end
+    return {
+        "last_end": cur,
+        "region_used": used,
+        "region_first": first,
+        "wrapped_bank0_pointers": False,
+        "unique_images": unique_images,
+        "duplicate_images": duplicate_images,
+        "duplicate_bytes_saved": duplicate_bytes_saved,
+    }
+
+
+def album_base__write_meta(
+    out: bytearray,
+    profile: UniversalProfile,
+    count: int,
+    tl: dict[str, int],
+    mode: str,
+    extra: dict[str, Any],
+) -> None:
+    payload = {
+        "format": album_base__PROJECT_FORMAT,
+        "app_version": album_base__APP_VERSION,
+        "profile_version": profile.version,
+        "roster_count": count,
+        "image_count": tl["image_count"],
+        "stat_table": tl["stat"],
+        "size_table": tl["size"],
+        "jogress_pointer_table": tl["jog_ptr"],
+        "jogress_rows": tl["jog_rows"],
+        "evolution_cave": tl["evo"],
+        "mode": mode,
+        "acquired_ram_base": album_base__ACQUIRED_RAM_BASE,
+        "visible_ram_base": album_base__VISIBLE_RAM_BASE,
+        **extra,
+    }
+    b = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
+    if len(b) + 12 > album_base__METADATA_SIZE:
+        raise ValueError("메타데이터 공간 초과")
+    out[album_base__METADATA_OFFSET : album_base__METADATA_OFFSET + album_base__METADATA_SIZE] = (
+        b"\x00" * album_base__METADATA_SIZE
+    )
+    out[album_base__METADATA_OFFSET : album_base__METADATA_OFFSET + 8] = album_base__METADATA_MAGIC
+    core__write_u32(out, album_base__METADATA_OFFSET + 8, len(b))
+    out[album_base__METADATA_OFFSET + 12 : album_base__METADATA_OFFSET + 12 + len(b)] = b
+
+
+globals()["universal__APP_VERSION"] = album_base__APP_VERSION
+globals()["universal__PROJECT_FORMAT"] = album_base__PROJECT_FORMAT
+globals()["universal__PROJECT_ROSTER_COUNT"] = album_base__PROJECT_ROSTER_COUNT
+globals()["universal__STANDARD_ROSTER_COUNT"] = album_base__STANDARD_ROSTER_COUNT
+globals()["universal__EXTENDED_ROSTER_COUNT"] = album_base__EXTENDED_ROSTER_COUNT
+globals()["universal__activate"] = album_base__activate
+globals()["universal__identify_layout"] = album_base__identify_layout
+globals()["universal__read_images_flexible"] = album_base__read_images_flexible
+globals()["universal__create_project_from_rom"] = album_base__create_project_from_rom
+globals()["universal__save_universal_project"] = album_base__save_project
+globals()["universal__load_universal_project"] = album_base__load_project
+globals()["universal__build_universal_rom"] = album_base__build_rom
+
+
+class album_base__GUI(universal__UniversalEditorGUI):
+
+    def _retitle_roster_label(self):
+
+        def walk(w):
+            for c in w.winfo_children():
+                try:
+                    t = c.cget("text")
+                    if str(t).startswith("로스터 ID"):
+                        c.configure(
+                            text="로스터 ID 000–265 (000–113: 8MB 슬롯, 114–265: 16MB 슬롯)"
+                        )
+                except Exception:
+                    pass
+                walk(c)
+
+        walk(self.root)
+
+    def _build_menu(self):
+        from tkinter import Menu
+
+        m = Menu(self.root)
+        f = Menu(m, tearoff=False)
+        f.add_command(label="PenC0~PenC5 ROM 열기...", command=self.open_rom_dialog)
+        f.add_command(label="프로젝트 열기...", command=self.open_project_dialog)
+        f.add_command(label="프로젝트 저장", command=self.save_project_action)
+        f.add_command(
+            label="프로젝트 다른 이름으로 저장...", command=lambda: self.save_project_action(True)
+        )
+        f.add_separator()
+        f.add_command(
+            label="표준 ROM 저장 (8 MiB / 최대 114슬롯)...",
+            command=lambda: self.build_rom_mode(False),
+        )
+        f.add_command(
+            label="확장 ROM 저장 (16 MiB / 최대 266슬롯)...",
+            command=lambda: self.build_rom_mode(True),
+        )
+        f.add_separator()
+        f.add_command(label="종료", command=self.root.destroy)
+        m.add_cascade(label="파일", menu=f)
+        t = Menu(m, tearoff=False)
+        t.add_command(label="기반 ROM 다시 선택...", command=self.reload_references)
+        t.add_command(label="프로젝트 검증", command=self.validate_action)
+        m.add_cascade(label="도구", menu=t)
+        self.root.config(menu=m)
+
+    def update_capacity(self):
+        if self.project is None or self.profile is None:
+            return
+        try:
+            a = album_base__table_layout(self.profile, album_base__STANDARD_ROSTER_COUNT)
+            b = album_base__table_layout(self.profile, album_base__EXTENDED_ROSTER_COUNT)
+            self.capacity_var.set(
+                f"8MB 최대 {album_base__STANDARD_ROSTER_COUNT}슬롯(완전 고유 45마리 기준) | 16MB 최대 {album_base__EXTENDED_ROSTER_COUNT}슬롯(완전 고유 197마리 기준) | 동일 프레임 자동 공유 | 도감 번호 001–266"
+            )
+        except Exception as exc:
+            self.capacity_var.set(str(exc))
+
+
+import argparse
+import copy
+import json
+import os
+import struct
+import sys
+import traceback
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any, Optional
+
+album_layers__APP_VERSION = "4.2.0"
+album_layers__PROJECT_FORMAT = "PenCUniversalProject\x5611"
+album_layers__PROJECT_ROSTER_COUNT = 266
+album_layers__STANDARD_ROSTER_COUNT = 114
+album_layers__EXTENDED_ROSTER_COUNT = 266
+album_layers__STOCK_ROM_SIZE = relocation__STOCK_ROM_SIZE
+album_layers__EXTENDED_ROM_SIZE = relocation__EXTENDED_ROM_SIZE
+album_layers__FLASH_BANK1 = relocation__FLASH_BANK1
+album_layers__SAVE_TAIL_START = relocation__SAVE_TAIL_START
+album_layers__SAVE_TAIL_END = relocation__SAVE_TAIL_END
+album_layers__METADATA_OFFSET = relocation__METADATA_OFFSET
+album_layers__METADATA_SIZE = relocation__METADATA_SIZE
+album_layers__METADATA_MAGIC = b"PCU\x5611M1"
+album_layers__ACQUIRED_RAM_BASE = relocation__ACQUIRED_RAM_BASE
+album_layers__VISIBLE_RAM_BASE = relocation__VISIBLE_RAM_BASE
+album_layers__ALBUM_NUMBER_SITES = {
+    0: (22718, 22858, 104572),
+    1: (22352, 22492, 102624),
+    2: (22268, 22408, 102558),
+    3: (22292, 22432, 102564),
+    4: (22602, 22742, 104126),
+    5: (22620, 22760, 104138),
+}
+album_layers__PROFILES = relocation__PROFILES
+album_layers__RomLayout = relocation__RomLayout
+
+
+def album_layers__activate(
+    profile: UniversalProfile, target_count: int, tl: Optional[dict[str, int]] = None
+) -> None:
+    relocation__activate(profile, target_count, tl)
+
+
+def album_layers__read_meta(data: bytes) -> Optional[dict[str, Any]]:
+    for magic in (
+        album_layers__METADATA_MAGIC,
+        b"PCU\x5610M1",
+        b"PCU\x569M01",
+        relocation__METADATA_MAGIC,
+        b"PCU\x567M01",
+        universal__METADATA_MAGIC,
+    ):
+        if (
+            data[album_layers__METADATA_OFFSET : album_layers__METADATA_OFFSET + len(magic)]
+            == magic
+        ):
+            n = core__read_u32(data, album_layers__METADATA_OFFSET + len(magic))
+            if 0 < n < album_layers__METADATA_SIZE - len(magic) - 4:
+                try:
+                    return json.loads(
+                        data[
+                            album_layers__METADATA_OFFSET
+                            + len(magic)
+                            + 4 : album_layers__METADATA_OFFSET
+                            + len(magic)
+                            + 4
+                            + n
+                        ].decode("utf-8")
+                    )
+                except Exception:
+                    return None
+    return None
+
+
+def album_layers__table_layout(profile: UniversalProfile, target_count: int) -> dict[str, int]:
+    return relocation__table_layout(profile, target_count)
+
+
+globals()["relocation__read_meta"] = album_layers__read_meta
+
+
+def album_layers__identify_layout(data: bytes) -> album_layers__RomLayout:
+    if len(data) not in (album_layers__STOCK_ROM_SIZE, album_layers__EXTENDED_ROM_SIZE):
+        raise ValueError("8 MiB 또는 16 MiB ROM만 지원합니다")
+    m = album_layers__read_meta(data)
+    if m and m.get("format") in (
+        album_layers__PROJECT_FORMAT,
+        "PenCUniversalProject\x5610",
+        "PenCUniversalProject\x569",
+        relocation__PROJECT_FORMAT,
+        "PenCUniversalProject\x567",
+        universal__PROJECT_FORMAT,
+    ):
+        p = album_layers__PROFILES[int(m["profile_version"])]
+        return album_layers__RomLayout(
+            p,
+            int(m["roster_count"]),
+            int(m["image_count"]),
+            int(m["stat_table"]),
+            int(m["size_table"]),
+            str(m.get("mode", "patched")),
+        )
+    return relocation__identify_layout(data)
+
+
+def album_layers___divide_current_r4(divisor: int, quotient: bool) -> list[int]:
+    if divisor <= 63:
+        w = [38464 | divisor]
+    else:
+        w = [38667, divisor]
+    w += [54920, 55432]
+    w += list(universal___call_words_for_raw(49932 if quotient else 49746))
+    w += [66]
+    return w
+
+
+def album_layers___load_album_number() -> list[int]:
+    return [65024, 39180, 2154, 39140, 2113]
+
+
+def album_layers___set_draw_args(
+    layer: int, image_reg_is_r1: bool, x: int, draw_raw: int
+) -> list[int]:
+
+    w: list[int] = [38667, layer, 2312, 1, 54980]
+    if image_reg_is_r1:
+        w += [1801, 147]
+    else:
+        raise ValueError("현재 구현은 r1 digit만 지원합니다")
+    w += [2312, 2, 54980, 38667, x, 2312, 3, 54980, 38512, 2312, 4, 54980, 38465, 2312, 5, 54980]
+    w += list(universal___call_words_for_raw(draw_raw))
+    return w
+
+
+def album_layers__build_album_hundreds_setup(placeholder_call_raw: int) -> list[int]:
+
+    w: list[int] = []
+    w += [38667, 11, 2312, 1, 54980]
+    w += album_layers___load_album_number()
+    w += album_layers___divide_current_r4(100, True)
+    w += [1801, 147, 2312, 2, 54980]
+    w += [38667, 52, 2312, 3, 54980]
+    w += [38512, 2312, 4, 54980]
+    w += [38465, 2312, 5, 54980]
+    w += list(core__far_goto_words(placeholder_call_raw))
+    return w
+
+
+def album_layers__build_album_tens_ones(draw_raw: int, return_raw: int) -> list[int]:
+
+    w: list[int] = []
+    w += album_layers___load_album_number()
+    w += album_layers___divide_current_r4(10, True)
+    w += [53760, 38912]
+    w += album_layers___divide_current_r4(10, False)
+    w += album_layers___set_draw_args(12, True, 68, draw_raw)
+    w += album_layers___load_album_number()
+    w += album_layers___divide_current_r4(10, False)
+    w += album_layers___set_draw_args(13, True, 84, draw_raw)
+    w += list(core__far_goto_words(return_raw))
+    return w
+
+
+def album_layers__build_rom(
+    project: core.Project, source: bytes, layout: RomLayout, target: int, extended: bool
+):
+    expected = (
+        album_layers__EXTENDED_ROSTER_COUNT if extended else album_layers__STANDARD_ROSTER_COUNT
+    )
+    if target != expected:
+        raise ValueError(f"\x5611 {('16MB' if extended else '8MB')} 저장 수는 {expected}마리입니다")
+    p = layout.profile
+    tl = album_layers__table_layout(p, target)
+    album_layers__activate(p, target, tl)
+    bp = core__Project(
+        slots=copy.deepcopy(project.slots[:target]), rom_files=dict(project.rom_files)
+    )
+    core__validate_project(bp)
+    srcimgs = album_layers__read_images_flexible(source, layout.image_count, layout.size_table)
+    out = bytearray(
+        b"\xff" * (album_layers__EXTENDED_ROM_SIZE if extended else album_layers__STOCK_ROM_SIZE)
+    )
+    out[:album_layers__STOCK_ROM_SIZE] = source[:album_layers__STOCK_ROM_SIZE]
+    save = bytes(source[album_layers__SAVE_TAIL_START:album_layers__SAVE_TAIL_END])
+    out[album_layers__METADATA_OFFSET:relocation__TABLE_AREA_END] = b"\x00" * (
+        relocation__TABLE_AREA_END - album_layers__METADATA_OFFSET
+    )
+    final = list(srcimgs[: p.stock_image_count])
+    statslist: list[list[int]] = []
+    for s in bp.slots:
+        st = list(s.stats)
+        if s.digimon_id < p.stock_roster_count:
+            start = 240 + s.digimon_id * 12
+            st[0] = start
+            if s.digimon_id < layout.roster_count:
+                st[core__ALBUM_ORDER_STAT_INDEX] = core__read_stat_words(
+                    source, s.digimon_id, layout.stat_table
+                )[core__ALBUM_ORDER_STAT_INDEX]
+            for j, ref in enumerate(s.frames):
+                final[start + j] = core__resolve_frame(ref, srcimgs)
+        else:
+            start = p.stock_image_count + (s.digimon_id - p.stock_roster_count) * 12
+            st[0] = start
+            st[core__ALBUM_ORDER_STAT_INDEX] = s.digimon_id
+            final.extend((core__resolve_frame(ref, srcimgs) for ref in s.frames))
+        statslist.append(st)
+    if len(final) != tl["image_count"]:
+        raise AssertionError("image count")
+    img_report = album_layers__write_images_safe(out, final, extended)
+    for i, img in enumerate(final):
+        core__write_u16(out, tl["size"] + i * 4, img.width)
+        core__write_u16(out, tl["size"] + i * 4 + 2, img.height)
+    for s, st in zip(bp.slots, statslist):
+        core__write_stat_words(out, s.digimon_id, st, tl["stat"])
+    core__write_u16(out, p.stat_lookup_site, tl["stat"] // 2 & 65535)
+    relocation__patch_size_table_sites(out, p, tl["size"])
+    for off in p.image_max_offsets:
+        core__write_u16(out, off, tl["image_count"] - 1)
+    cave = relocation__Cave(out)
+    ram_report = album_layers__patch_album_ram_safe(out, source, target, cave)
+    for off in p.roster_max_offsets:
+        relocation__patch_wide_compare(out, off, target - 1, cave, source)
+    album_info = relocation__patch_album_visibility(out, source, p, target - 1, cave)
+    album_cursor = relocation__patch_album_cursor(out, p, target, cave)
+    number_info = album_layers__patch_album_number(out, p, cave)
+    evo, evo_report = relocation__build_evolution_wide(bp.slots, p, tl)
+    out[tl["evo"] : tl["evo_end"]] = b"\x00" * (tl["evo_end"] - tl["evo"])
+    out[tl["evo"] : tl["evo"] + len(evo)] = evo
+    core__write_far_goto(out, p.evolution_hook, tl["evo"])
+    relocation__patch_jogress(out, source, layout, target, tl, cave)
+    extra = {
+        **ram_report,
+        **album_info,
+        **number_info,
+        "album_cursor": album_cursor,
+        "image_pointer_policy": "nonnegative-relative-only",
+    }
+    album_layers__write_meta(
+        out,
+        p,
+        target,
+        tl,
+        "extended16-safe-positive" if extended else "standard8-safe-bank1",
+        extra,
+    )
+    if out[album_layers__SAVE_TAIL_START:album_layers__SAVE_TAIL_END] != save:
+        raise AssertionError("save tail changed")
+    decoded = []
+    for i in range(tl["image_count"]):
+        rel = core__read_u32(out, album_layers__FLASH_BANK1 + i * 4)
+        addr = album_layers__FLASH_BANK1 + rel
+        decoded.append(addr)
+        if addr < album_layers__FLASH_BANK1:
+            raise AssertionError(f"negative/wrapped image pointer at {i}: {addr:#x}")
+        if album_layers__SAVE_TAIL_START <= addr < album_layers__SAVE_TAIL_END:
+            raise AssertionError(f"save-tail image pointer at {i}: {addr:#x}")
+        if addr >= len(out):
+            raise AssertionError(f"out-of-ROM image pointer at {i}: {addr:#x}")
+    report = {
+        "format": "PenC Universal Editor \x5611 build report",
+        "app_version": album_layers__APP_VERSION,
+        "profile": p.label,
+        "mode": f"{('16MiB' if extended else '8MiB')}/{target}",
+        "rom_size": len(out),
+        "roster_count": target,
+        "max_id": target - 1,
+        "no_result_id": target,
+        "total_image_count": tl["image_count"],
+        "tables": tl,
+        "images": img_report,
+        "album_number": number_info,
+        "album_number_format": "fixed 3-digit decimal; stock layer 11 setup replaced in-place, layers 12/13 retained",
+        "wide_limit_sites": len(p.roster_max_offsets),
+        "album_ram": ram_report,
+        "evolution": evo_report,
+        "save_tail_preserved": True,
+        "minimum_image_address": min(decoded),
+        "maximum_image_address": max(decoded),
+        "source_sha256": core__sha256(source),
+        "output_sha256": core__sha256(out),
+        "hist_dc_hardware_findings": {
+            "F0_F9": "100-109 rendered through non-digit glyphs by the stock two-digit routine",
+            "o0_o4": "110-114 rendered through non-digit glyphs by the stock two-digit routine",
+            "corrupted_last_sprite": "wrapped bank0 relative image pointer rejected by hardware",
+            "album_entry_reset": "\x569 used invalid display layer 14; \x5610 recreated stock layer 11; \x5611 injects the digit into its original creation",
+            "sleep_no_wake": "\x567-\x569 blindly rewrote two r4 += 15 operands; \x5610 repairs and semantically filters RAM references",
+        },
+        "warning": "8MiB \x5611 intentionally returns to the proven bank1-only sprite layout. 16MiB positive offsets above 0x800000 still require MX25L12833F real-hardware testing.",
+    }
+    return (bytes(out), report)
+
+
+def album_layers__create_project_from_rom(path: Path):
+    data = path.read_bytes()
+    layout = album_layers__identify_layout(data)
+    album_layers__activate(layout.profile, album_layers__PROJECT_ROSTER_COUNT)
+    images = album_layers__read_images_flexible(data, layout.image_count, layout.size_table)
+    slots: list[core__DigimonSlot] = []
+    current = min(layout.roster_count, album_layers__PROJECT_ROSTER_COUNT)
+    for did in range(current):
+        stats = core__read_stat_words(data, did, layout.stat_table)
+        start = stats[0]
+        frames = [core__FrameRef("base", start + i) for i in range(12)]
+        name = (
+            core__DEFAULT_DISPLAY_NAMES[did]
+            if layout.profile.version == 1 and did < len(core__DEFAULT_DISPLAY_NAMES)
+            else f"VP{layout.profile.version} ID {did:03d}"
+        )
+        slots.append(core__DigimonSlot(did, name, stats, frames, core__EvolutionRoute()))
+    tid = max(0, current - 1)
+    ts = list(slots[tid].stats)
+    tf = copy.deepcopy(slots[tid].frames)
+    for did in range(current, album_layers__PROJECT_ROSTER_COUNT):
+        st = list(ts)
+        st[core__ALBUM_ORDER_STAT_INDEX] = did
+        st[core__ALBUM_VISIBLE_STAT_INDEX] = 1
+        slots.append(
+            core__DigimonSlot(
+                did,
+                f"추가 슬롯 {did:03d}",
+                st,
+                copy.deepcopy(tf),
+                core__EvolutionRoute(False, 0, []),
+            )
+        )
+    pr = core__Project(
+        slots=slots,
+        rom_files={"vanilla": str(path.resolve()), "profile_version": str(layout.profile.version)},
+    )
+    return (pr, data, images, layout)
+
+
+def album_layers__load_project(path: Path):
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    if obj.get("format") == album_layers__PROJECT_FORMAT:
+        version = int(obj["profile_version"])
+        base = Path(obj.get("base_rom", ""))
+        if not base.is_absolute():
+            base = (path.parent / base).resolve()
+        pr, data, imgs, layout = album_layers__create_project_from_rom(base)
+        if layout.profile.version != version:
+            raise ValueError("프로젝트와 기반 ROM 버전이 다릅니다")
+        loaded = [core__DigimonSlot.from_dict(x) for x in obj.get("slots", [])]
+        for i, slot in enumerate(loaded[:album_layers__PROJECT_ROSTER_COUNT]):
+            pr.slots[i] = slot
+        pr.project_path = path
+        pr.rom_files = {"vanilla": str(base), "profile_version": str(version)}
+        return (pr, data, imgs, layout)
+    if obj.get("format") in (
+        "PenCUniversalProject\x5610",
+        "PenCUniversalProject\x569",
+        relocation__PROJECT_FORMAT,
+        "PenCUniversalProject\x567",
+        universal__PROJECT_FORMAT,
+    ):
+        version = int(obj["profile_version"])
+        base = Path(obj.get("base_rom", ""))
+        if not base.is_absolute():
+            base = (path.parent / base).resolve()
+        pr, data, imgs, layout = album_layers__create_project_from_rom(base)
+        loaded = [core__DigimonSlot.from_dict(x) for x in obj.get("slots", [])]
+        for i, slot in enumerate(loaded[:album_layers__PROJECT_ROSTER_COUNT]):
+            pr.slots[i] = slot
+        pr.project_path = path
+        return (pr, data, imgs, layout)
+    legacy = core__load_project(path)
+    base = Path(legacy.rom_files.get("vanilla", "PenC1.bin"))
+    if not base.is_absolute():
+        base = (path.parent / base).resolve()
+    pr, data, imgs, layout = album_layers__create_project_from_rom(base)
+    for i, slot in enumerate(legacy.slots[:album_layers__PROJECT_ROSTER_COUNT]):
+        pr.slots[i] = slot
+    pr.project_path = path
+    return (pr, data, imgs, layout)
+
+
+def album_layers__patch_album_number(
+    out: bytearray, profile: UniversalProfile, cave: hist_dc.Cave
+) -> dict[str, int]:
+    tens_hook, return_raw, draw_raw = album_layers__ALBUM_NUMBER_SITES[profile.version]
+    placeholder_hook = tens_hook - 48
+    placeholder_call = tens_hook - 4
+    hundreds_words = album_layers__build_album_hundreds_setup(placeholder_call)
+    hundreds_impl = cave.put(hundreds_words)
+    core__write_far_goto(out, placeholder_hook, hundreds_impl)
+    tens_words = album_layers__build_album_tens_ones(draw_raw, return_raw)
+    tens_impl = cave.put(tens_words)
+    core__write_far_goto(out, tens_hook, tens_impl)
+    return {
+        "album_hundreds_impl": hundreds_impl,
+        "album_hundreds_words": len(hundreds_words),
+        "album_tens_ones_impl": tens_impl,
+        "album_tens_ones_words": len(tens_words),
+        "digits": 3,
+        "placeholder_hook": placeholder_hook,
+        "placeholder_call": placeholder_call,
+        "tens_hook": tens_hook,
+        "return": return_raw,
+        "draw_function": draw_raw,
+        "layer_policy": "stock layers 11/12/13 created exactly once",
+    }
+
+
+def album_layers__patch_album_ram_safe(
+    out: bytearray, source: bytes, target_count: int, cave: hist_dc.Cave
+) -> dict[str, Any]:
+
+    word_count = (target_count + 15) // 16
+    meta = album_layers__read_meta(source) or {}
+    old_a = int(meta.get("acquired_ram_base", 2127))
+    old_v = int(meta.get("visible_ram_base", 2131))
+    load_prefixes = {38667, 38154, 39180}
+    acquired_values = {old_a, 2127, album_layers__ACQUIRED_RAM_BASE}
+    visible_values = {old_v, 2131, album_layers__VISIBLE_RAM_BASE}
+    repl_a = repl_v = repaired_add15 = 0
+    for off in range(2, 139264, 2):
+        prev = core__read_u16(out, off - 2)
+        cur = core__read_u16(out, off)
+        nxt = core__read_u16(out, off + 2) if off + 2 < len(out) else 0
+        if prev == 47169 and nxt == 1800 and (cur in acquired_values):
+            if cur != 2127:
+                core__write_u16(out, off, 2127)
+                repaired_add15 += 1
+            continue
+        if prev not in load_prefixes:
+            continue
+        if cur in acquired_values:
+            core__write_u16(out, off, album_layers__ACQUIRED_RAM_BASE)
+            repl_a += 1
+        elif cur in visible_values:
+            core__write_u16(out, off, album_layers__VISIBLE_RAM_BASE)
+            repl_v += 1
+    if repl_a < 9 or repl_v < 3:
+        raise ValueError(
+            f"앨범 RAM 주소 참조 수가 예상보다 적습니다: acquired={repl_a}, visible={repl_v}"
+        )
+    if meta.get("acquired_clear_start") is not None:
+        acs = int(meta["acquired_clear_start"])
+        ac_resume = int(meta["acquired_clear_resume"])
+        vcs = int(meta["visible_clear_start"])
+        vc_resume = int(meta["visible_clear_resume"])
+    else:
+        acs, ac_resume = relocation__find_clear(source, 2127)
+        vcs, vc_resume = relocation__find_clear(source, 2131)
+    ac_tr = cave.put(
+        relocation__clear_words_code(album_layers__ACQUIRED_RAM_BASE, word_count, ac_resume)
+    )
+    core__write_far_goto(out, acs, ac_tr)
+    vc_tr = cave.put(
+        relocation__clear_words_code(album_layers__VISIBLE_RAM_BASE, word_count, vc_resume)
+    )
+    core__write_far_goto(out, vcs, vc_tr)
+    return {
+        "word_count": word_count,
+        "acquired_clear_start": acs,
+        "acquired_clear_resume": ac_resume,
+        "visible_clear_start": vcs,
+        "visible_clear_resume": vc_resume,
+        "refs_acquired": repl_a,
+        "refs_visible": repl_v,
+        "false_add15_operands_repaired": repaired_add15,
+        "relocation_policy": "verified-immediate-load-operands-only",
+    }
+
+
+def album_layers__project_to_dict(project: core.Project, profile_version: int) -> dict[str, Any]:
+    return {
+        "format": album_layers__PROJECT_FORMAT,
+        "app_version": album_layers__APP_VERSION,
+        "profile_version": profile_version,
+        "base_rom": project.rom_files.get("vanilla", ""),
+        "slots": [
+            {
+                "id": s.digimon_id,
+                "name": s.name,
+                "stats": s.stats,
+                "frames": [asdict(f) for f in s.frames],
+                "evolution": {
+                    "enabled": s.evolution.enabled,
+                    "source_id": s.evolution.source_id,
+                    "conditions": [asdict(c) for c in s.evolution.conditions],
+                },
+            }
+            for s in project.slots
+        ],
+    }
+
+
+def album_layers__read_images_flexible(
+    data: bytes, count: int, size_table: int
+) -> list[core__RomImage]:
+    return relocation__read_images_flexible(data, count, size_table)
+
+
+def album_layers__save_project(project: core.Project, profile_version: int, path: Path) -> None:
+    obj = album_layers__project_to_dict(project, profile_version)
+    base = Path(obj["base_rom"])
+    if base.is_absolute():
+        try:
+            obj["base_rom"] = os.path.relpath(base, path.parent).replace("\\", "/")
+        except ValueError:
+            pass
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    project.project_path = path
+
+
+def album_layers__write_images_safe(
+    data: bytearray, images: list[core.RomImage], extended: bool
+) -> dict[str, Any]:
+
+    count = len(images)
+    regions: list[list[Any]] = [
+        ["bank1", album_layers__FLASH_BANK1 + count * 4, album_layers__SAVE_TAIL_START]
+    ]
+    if extended:
+        regions.append(["uppe\x7216", album_layers__SAVE_TAIL_END, len(data)])
+    data[album_layers__FLASH_BANK1:album_layers__SAVE_TAIL_START] = b"\x00" * (
+        album_layers__SAVE_TAIL_START - album_layers__FLASH_BANK1
+    )
+    if extended:
+        data[album_layers__SAVE_TAIL_END:] = b"\xff" * (len(data) - album_layers__SAVE_TAIL_END)
+    ri = 0
+    cur = regions[0][1]
+    used = {r[0]: 0 for r in regions}
+    first: dict[str, int] = {}
+    seen: dict[tuple[int, int, bytes], int] = {}
+    duplicate_images = 0
+    duplicate_bytes_saved = 0
+    unique_images = 0
+    for i, img in enumerate(images):
+        size = len(img.pixels)
+        key = (img.width, img.height, img.pixels)
+        addr = seen.get(key)
+        if addr is not None:
+            duplicate_images += 1
+            duplicate_bytes_saved += size
+            core__write_u32(
+                data, album_layers__FLASH_BANK1 + i * 4, addr - album_layers__FLASH_BANK1
+            )
+            continue
+        if cur + size > regions[ri][2]:
+            ri += 1
+            if ri >= len(regions):
+                available = sum((int(r[2]) - int(r[1]) for r in regions))
+                used_total = sum(used.values())
+                raise ValueError(
+                    f"고유 이미지 공간 초과: image {i}, 사용 {used_total:,} / {available:,} bytes. 동일 프레임은 자동 공유되지만 현재 프로젝트의 서로 다른 픽셀이 칩 용량을 넘었습니다."
+                )
+            cur = regions[ri][1]
+        addr = cur
+        end = addr + size
+        rel = addr - album_layers__FLASH_BANK1
+        if rel < 0:
+            raise AssertionError("\x5611은 음수 이미지 포인터를 만들지 않습니다")
+        core__write_u32(data, album_layers__FLASH_BANK1 + i * 4, rel)
+        data[addr:end] = img.pixels
+        seen[key] = addr
+        unique_images += 1
+        used[regions[ri][0]] += size
+        first.setdefault(regions[ri][0], addr)
+        cur = end
+    return {
+        "last_end": cur,
+        "region_used": used,
+        "region_first": first,
+        "wrapped_bank0_pointers": False,
+        "unique_images": unique_images,
+        "duplicate_images": duplicate_images,
+        "duplicate_bytes_saved": duplicate_bytes_saved,
+    }
+
+
+def album_layers__write_meta(
+    out: bytearray,
+    profile: UniversalProfile,
+    count: int,
+    tl: dict[str, int],
+    mode: str,
+    extra: dict[str, Any],
+) -> None:
+    payload = {
+        "format": album_layers__PROJECT_FORMAT,
+        "app_version": album_layers__APP_VERSION,
+        "profile_version": profile.version,
+        "roster_count": count,
+        "image_count": tl["image_count"],
